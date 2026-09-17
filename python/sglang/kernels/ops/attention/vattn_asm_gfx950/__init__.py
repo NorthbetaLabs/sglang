@@ -5,7 +5,8 @@ KV cache, GQA ratios 16 and 8.
 vattn3_core.s (split-KV main kernel, one code object per GQA ratio) and vred.s
 (segment reduce) ship as source and are assembled at first use with ROCm clang
 into a per-process temp dir; launches go through ctypes hipModuleLaunchKernel
-on the current torch stream. Kernarg ABI is guarded three ways:
+on the current torch stream, bound to the HIP runtime torch itself is running
+on (see _torch_hip_runtime). Kernarg ABI is guarded three ways:
   1. single ctypes.Structure(_pack_=1) definition, fields filled by name;
   2. sizeof() asserted against the expected constant at import;
   3. sizeof() cross-checked against the .amdhsa_kernarg_size the kernel itself
@@ -94,10 +95,36 @@ def _declared_kernarg_size(source_file):
     return int(m.group(1))
 
 
+def _torch_hip_runtime():
+    """Path of the libamdhip64 torch itself is running on, or None.
+
+    ROCm 10 splits the SDK into a runtime wheel (_rocm_sdk_core, which torch
+    maps under its versioned SONAME libamdhip64.so.7) and a toolchain wheel
+    (_rocm_sdk_devel, which owns the unversioned libamdhip64.so on
+    LD_LIBRARY_PATH). dlopen matches an already-mapped object by SONAME, so
+    CDLL("libamdhip64.so") misses torch's copy and maps devel's as a *second*
+    HIP runtime with its own contexts and queues. Launches then carry a torch
+    stream handle into a runtime that never created it: they stop being ordered
+    against everything torch does and fail outright under graph capture.
+    """
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        find_loaded_library,
+    )
+
+    torch.cuda.current_device()  # map torch's copy before looking for it
+    return find_loaded_library("libamdhip64")
+
+
 def _hip_lib():
     global _hip
     if _hip is None:
-        _hip = ctypes.CDLL("libamdhip64.so")
+        path = _torch_hip_runtime()
+        if path is None:
+            # Never fall back to the SONAME: binding some other copy loads a
+            # second runtime, whose only symptom is unordered launches feeding
+            # silently wrong attention output. The Triton path is the safe loss.
+            _disable("torch has no libamdhip64 mapped to launch through")
+        _hip = ctypes.CDLL(path)
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _hip.hipModuleGetFunction.restype = ctypes.c_int
