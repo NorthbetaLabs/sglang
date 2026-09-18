@@ -23,6 +23,12 @@ struct LocalStorage {
   T data[N];
 };
 
+template <typename FullPackage, uint32_t kFullLoopCount, uint32_t kTailLoopCount>
+struct TransferStorage {
+  LocalStorage<FullPackage, kFullLoopCount == 0 ? 1 : kFullLoopCount> full;
+  LocalStorage<uint1, kTailLoopCount == 0 ? 1 : kTailLoopCount> tail;
+};
+
 template <int kUnit>
 inline constexpr auto get_mem_package() {
   if constexpr (kUnit == 16) {
@@ -125,20 +131,31 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
 
 template <int64_t kBytes, uint32_t kNumThreads>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
-  static_assert(kBytes % 128 == 0, "kBytes must be multiple of 128 bytes");
   static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
-  constexpr uint32_t kLoopCount = kBytes / 128;
-  using Package = details::PackageType<128 / kNumThreads>;
-  using Storage = details::LocalStorage<Package, kLoopCount>;
+  constexpr uint32_t kFullLoopCount = kBytes / 128;
+  constexpr uint32_t kTailBytes = kBytes % 128;
+  constexpr uint32_t kTailBytesPerLoop = sizeof(uint1) * kNumThreads;
+  static_assert(kTailBytes % kTailBytesPerLoop == 0, "Tail must be distributed as 32-bit words");
+  constexpr uint32_t kTailLoopCount = kTailBytes / kTailBytesPerLoop;
+  using FullPackage = details::PackageType<128 / kNumThreads>;
+  using Storage = details::TransferStorage<FullPackage, kFullLoopCount, kTailLoopCount>;
 
-  const auto src_packed = static_cast<const Package*>(src);
+  const auto src_packed = static_cast<const FullPackage*>(src);
   const auto lane_id = threadIdx.x % kNumThreads;
   Storage vec;
 
-#pragma unroll kLoopCount
-  for (uint32_t i = 0; i < kLoopCount; ++i) {
+#pragma unroll kFullLoopCount
+  for (uint32_t i = 0; i < kFullLoopCount; ++i) {
     const auto j = i * kNumThreads + lane_id;
-    vec.data[i] = details::load_nc(&src_packed[j]);
+    vec.full.data[i] = details::load_nc(&src_packed[j]);
+  }
+
+  const auto src_tail = reinterpret_cast<const uint1*>(
+      static_cast<const uint8_t*>(src) + kFullLoopCount * 128);
+#pragma unroll kTailLoopCount
+  for (uint32_t i = 0; i < kTailLoopCount; ++i) {
+    const auto j = i * kNumThreads + lane_id;
+    vec.tail.data[i] = details::load_nc(&src_tail[j]);
   }
 
   return vec;
@@ -146,18 +163,28 @@ SGL_DEVICE auto load_vec(const void* __restrict__ src) {
 
 template <int64_t kBytes, uint32_t kNumThreads, typename Storage>
 SGL_DEVICE void store_vec(void* __restrict__ dst, const Storage& vec) {
-  using Package = std::decay_t<decltype(vec.data[0])>;
-  constexpr uint32_t kBytesPerLoop = sizeof(Package) * kNumThreads;
-  constexpr uint32_t kLoopCount = kBytes / kBytesPerLoop;
-  static_assert(kBytes % kBytesPerLoop == 0, "Invalid Storage configuration");
+  constexpr uint32_t kFullLoopCount = kBytes / 128;
+  constexpr uint32_t kTailBytes = kBytes % 128;
+  constexpr uint32_t kTailBytesPerLoop = sizeof(uint1) * kNumThreads;
+  static_assert(kTailBytes % kTailBytesPerLoop == 0, "Tail must be distributed as 32-bit words");
+  constexpr uint32_t kTailLoopCount = kTailBytes / kTailBytesPerLoop;
+  using FullPackage = std::decay_t<decltype(vec.full.data[0])>;
 
-  const auto dst_packed = static_cast<Package*>(dst);
+  const auto dst_packed = static_cast<FullPackage*>(dst);
   const auto lane_id = threadIdx.x % kNumThreads;
 
-#pragma unroll kLoopCount
-  for (uint32_t i = 0; i < kLoopCount; ++i) {
+#pragma unroll kFullLoopCount
+  for (uint32_t i = 0; i < kFullLoopCount; ++i) {
     const auto j = i * kNumThreads + lane_id;
-    details::store_nc(&dst_packed[j], vec.data[i]);
+    details::store_nc(&dst_packed[j], vec.full.data[i]);
+  }
+
+  auto dst_tail = reinterpret_cast<uint1*>(
+      static_cast<uint8_t*>(dst) + kFullLoopCount * 128);
+#pragma unroll kTailLoopCount
+  for (uint32_t i = 0; i < kTailLoopCount; ++i) {
+    const auto j = i * kNumThreads + lane_id;
+    details::store_nc(&dst_tail[j], vec.tail.data[i]);
   }
 }
 

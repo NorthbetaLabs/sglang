@@ -39,7 +39,9 @@ DEVICE = "cuda"
 PAGE_SIZE = 1 if is_hip() else 16
 NUM_LAYERS = 2
 MHA_ELEMENT_DIMS = [128, 512]
-MLA_ELEMENT_DIMS = [576]
+# 288 bf16 values occupy 576 bytes and exercise the vector-tail path used by
+# GLM-5.x FP8 KV entries. 576 values retain the existing aligned MLA case.
+MLA_ELEMENT_DIMS = [288, 576]
 # Include counts around and above the staging capacity so both the single-pass
 # and the multi-chunk staged relayout branches are exercised.
 PAGE_COUNTS = [1, 64, 65, 129]
