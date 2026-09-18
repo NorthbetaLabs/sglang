@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -69,6 +69,28 @@ class TestFromString(_RegistryIsolated):
         self.assertIs(
             SpeculativeAlgorithm.from_string("my_foo"),
             SpeculativeAlgorithm.from_string("MY_FOO"),
+        )
+
+
+class TestDisaggregationDraftInput(CustomTestCase):
+    def test_dflash_builds_disaggregation_draft_input(self):
+        batch = MagicMock()
+        last_tokens_tensor = MagicMock()
+        future_map = MagicMock()
+        expected = MagicMock()
+
+        with patch(
+            "sglang.srt.speculative.dflash_disaggregation."
+            "build_dflash_family_disagg_draft_input",
+            return_value=expected,
+        ) as build_draft_input:
+            actual = SpeculativeAlgorithm.DFLASH.build_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
+            )
+
+        self.assertIs(actual, expected)
+        build_draft_input.assert_called_once_with(
+            batch, last_tokens_tensor, future_map
         )
 
 
