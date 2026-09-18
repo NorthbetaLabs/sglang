@@ -160,8 +160,17 @@ def can_use_hicache_jit_kernel(
         return True
     unroll = unroll or _default_unroll(element_size)
     if not _tiles_across_lanes(element_size, unroll):
-        logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
-        return False
+        # Vector-tail sizes (kBytes % 128 != 0, e.g. DSA partial layers) are
+        # handled by the kernel's full+tail decomposition: 128B full rounds
+        # plus a 4B-per-lane tail round. Eligible when the tail splits into
+        # 32-bit words across the worker lanes (mirrors TransferStorage).
+        lanes = COPY_GROUP_THREADS // unroll if unroll else COPY_GROUP_THREADS
+        # The tail round is one 4-byte word per lane (uint1), so the tail must
+        # be a multiple of 4 * lanes bytes (e.g. DSA indexer 160B/token with
+        # unroll 4: tail 32B == 4 * 8 lanes passes; a 16B tail does not).
+        if element_size % 128 == 0 or (element_size % 128) % (4 * lanes) != 0:
+            logger.warning(f"Unsupported tail {element_size % 128 = } for JIT HiCache kernel")
+            return False
     try:
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
         _jit_hicache_module(
