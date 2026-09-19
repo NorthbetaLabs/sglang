@@ -1630,6 +1630,14 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
+    # For PD disaggregation. The external router injects the same bootstrap
+    # tuple into the prefill and decode copies of a Responses request. Keep
+    # these fields typed here so Pydantic does not discard them before the
+    # request is adapted to GenerateReqInput.
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0

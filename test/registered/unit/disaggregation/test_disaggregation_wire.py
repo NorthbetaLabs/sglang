@@ -1,3 +1,4 @@
+import asyncio
 import struct
 import threading
 import unittest
@@ -8,7 +9,11 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -50,6 +55,37 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_prefill_generation_is_part_of_common_wire_metadata(self):
+        info = PrefillServerInfo(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=1,
+            kv_cache_dtype="auto",
+            follow_bootstrap_room=True,
+            generation_id="generation-a",
+        )
+
+        self.assertEqual(info.generation_id, "generation-a")
+
+    def test_bootstrap_health_exposes_process_generation(self):
+        server = object.__new__(CommonKVBootstrapServer)
+        server.generation_id = "generation-a"
+
+        response = asyncio.run(server._handle_health_check(None))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["X-SGLang-PD-Generation"], "generation-a")
+
+    def test_generation_change_uses_backend_neutral_peer_invalidation(self):
+        manager = object.__new__(CommonKVManager)
+        manager._handle_node_failure = Mock()
+
+        manager._handle_prefill_generation_change("127.0.0.1:18998", "old", "new")
+
+        manager._handle_node_failure.assert_called_once_with("127.0.0.1:18998")
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",

@@ -893,6 +893,25 @@ class EnginePassthroughTestCase(CustomTestCase):
 
         self.assertTrue(captured["adapted_request"].require_reasoning)
 
+    def test_pd_bootstrap_fields_forwarded_to_engine(self):
+        serving = make_serving()
+        captured = self._capture(
+            serving,
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                store=False,
+                bootstrap_host="192.0.2.10",
+                bootstrap_port=19740,
+                bootstrap_room=123456,
+            ),
+        )
+
+        adapted = captured["adapted_request"]
+        self.assertEqual(adapted.bootstrap_host, "192.0.2.10")
+        self.assertEqual(adapted.bootstrap_port, 19740)
+        self.assertEqual(adapted.bootstrap_room, 123456)
+
     def test_prefilled_think_template_opens_the_parser(self):
         """``force_reasoning`` is a template property, not a request one, so it
         drives the parser but never the engine flag -- as on the chat path."""

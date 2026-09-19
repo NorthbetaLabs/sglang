@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -108,6 +109,10 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    # Changes every time the prefill bootstrap process is created. A decode
+    # worker uses this to distinguish a recovered process at the same address
+    # from transport state owned by the previous process generation.
+    generation_id: Optional[str] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -130,6 +135,9 @@ class PrefillServerInfo:
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
+        self.generation_id = (
+            str(self.generation_id) if self.generation_id is not None else None
         )
 
 
@@ -257,6 +265,7 @@ class CommonKVManager(BaseKVManager):
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
+            self.prefill_generation_table: Dict[str, str] = {}
             self.heartbeat_failures: Dict[str, int] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
@@ -672,6 +681,8 @@ class CommonKVManager(BaseKVManager):
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
+        if info.generation_id is not None:
+            self.prefill_generation_table[bootstrap_addr] = info.generation_id
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
 
@@ -1101,6 +1112,33 @@ class CommonKVManager(BaseKVManager):
                         )
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
+                            generation_id = response.headers.get(
+                                "X-SGLang-PD-Generation"
+                            )
+                            previous_generation = self.prefill_generation_table.get(
+                                bootstrap_addr
+                            )
+                            if (
+                                generation_id is not None
+                                and previous_generation is not None
+                                and generation_id != previous_generation
+                            ):
+                                logger.warning(
+                                    "Prefill generation changed at %s: %s -> %s; "
+                                    "invalidating the old transport peer",
+                                    bootstrap_addr,
+                                    previous_generation,
+                                    generation_id,
+                                )
+                                self._handle_prefill_generation_change(
+                                    bootstrap_addr,
+                                    previous_generation,
+                                    generation_id,
+                                )
+                            if generation_id is not None:
+                                self.prefill_generation_table[bootstrap_addr] = (
+                                    generation_id
+                                )
                             self._on_heartbeat_success(bootstrap_addr)
                         else:
                             logger.info(
@@ -1130,6 +1168,18 @@ class CommonKVManager(BaseKVManager):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
         pass
 
+    def _handle_prefill_generation_change(
+        self, bootstrap_addr: str, old_generation: str, new_generation: str
+    ):
+        """Invalidate state tied to a replaced prefill process.
+
+        Backends with process-scoped transport resources can override
+        ``_handle_node_failure`` and reuse the same teardown for both an
+        observed outage and a restart fast enough to occur between heartbeat
+        failures.
+        """
+        self._handle_node_failure(bootstrap_addr)
+
     def _handle_node_failure(self, failed_bootstrap_addr: str):
         """Handle failure of a prefill node."""
         with self.connection_lock:
@@ -1148,6 +1198,8 @@ class CommonKVManager(BaseKVManager):
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            if hasattr(self, "prefill_generation_table"):
+                self.prefill_generation_table.pop(failed_bootstrap_addr, None)
 
             possible_affected_rooms = list(
                 self.addr_to_rooms_tracker.get(failed_bootstrap_addr, [])
@@ -1667,6 +1719,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.host = host
         self.port = port
         self.app = web.Application()
+        self.generation_id = uuid.uuid4().hex
         self.store = dict()
         self.lock = asyncio.Lock()
         # The event loop only keeps weak references to tasks, so a long-lived
@@ -1719,7 +1772,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        return web.Response(
+            text="OK",
+            status=200,
+            headers={"X-SGLang-PD-Generation": self.generation_id},
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1847,6 +1904,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                generation_id=self.generation_id,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 
