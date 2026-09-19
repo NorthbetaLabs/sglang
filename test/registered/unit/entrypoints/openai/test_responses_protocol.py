@@ -47,6 +47,23 @@ class ResponsesRequestTestCase(CustomTestCase):
         self.assertEqual(request.routed_dp_rank, 1)
         self.assertEqual(request.disagg_prefill_dp_rank, 0)
 
+    def test_pd_bootstrap_fields_survive_validation_and_serialization(self):
+        request = ResponsesRequest.model_validate(
+            {
+                "model": "x",
+                "input": "hi",
+                "store": False,
+                "bootstrap_host": "192.0.2.10",
+                "bootstrap_port": 19740,
+                "bootstrap_room": 123456,
+            }
+        )
+
+        self.assertEqual(request.bootstrap_host, "192.0.2.10")
+        self.assertEqual(request.bootstrap_port, 19740)
+        self.assertEqual(request.bootstrap_room, 123456)
+        self.assertEqual(request.model_dump()["bootstrap_room"], 123456)
+
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",
