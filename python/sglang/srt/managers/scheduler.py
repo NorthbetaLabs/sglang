@@ -1363,8 +1363,6 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        # PBD handoff fast-path: last bootstrap-thread notify counter seen.
-        self._last_bootstrap_notify = 0
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None

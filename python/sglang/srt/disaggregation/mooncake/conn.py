@@ -226,13 +226,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
-            # PBD handoff fast-path: incremented by the bootstrap thread each
-            # time a room reaches WaitingForInput. The scheduler polls this
-            # counter between event-loop ticks (after the current chunk's
-            # forward) instead of waiting for the next tick boundary; the
-            # value itself is only a hint - consensus still flows through the
-            # regular poll_and_all_reduce path. Local rank view only.
-            self._bootstrap_ready_notify = 0
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -2140,14 +2133,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             0,
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
-                        # PBD handoff fast-path: signal the scheduler that a
-                        # room newly reached WaitingForInput since it last
-                        # checked. int += on a plain attribute is safe here:
-                        # the bootstrap thread is the sole writer and the
-                        # scheduler only reads it between ticks (GIL-atomic
-                        # int access; worst case the scheduler sees the bump
-                        # one loop iteration later, which is the status quo).
-                        self._bootstrap_ready_notify += 1
 
         threading.Thread(target=bootstrap_thread).start()
 
