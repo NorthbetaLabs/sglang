@@ -245,6 +245,19 @@ class DecodeKVCacheOffloadManager:
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
+        if not self.tree_cache.disable:
+            # PBD fork: ported from upstream PR #32170. With decode radix
+            # cache enabled, the raw frees below would double-free tree-owned
+            # prefix slots and leak the prealloc prefix lock; route through
+            # the radix-aware release instead: insert committed KV into the
+            # tree, free only duplicates / the unaligned tail / spec-over-
+            # allocated slots, and balance the lock via dec_lock_ref.
+            from sglang.srt.mem_cache.common import release_kv_cache
+
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+            self.offloaded_state.pop(req.rid, None)
+            return
+
         kv_committed_len = req.effective_kv_committed_len()
 
         # Prefill-aligned slots are freed only here, at request finish; freeing
@@ -267,7 +280,10 @@ class DecodeKVCacheOffloadManager:
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # PBD fork (upstream PR #32170): no raw protected_size_ manipulation
+        # here. ChunkCache reports protected_size() == 0 unconditionally, and
+        # for radix caches the balanced inc/dec_lock_ref pair in
+        # release_kv_cache owns that counter (see radix-aware routing above).
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):

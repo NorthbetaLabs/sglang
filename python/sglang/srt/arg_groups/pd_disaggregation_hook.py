@@ -87,10 +87,17 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if cfg.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                # PBD fork: ported from upstream PR #32170 - the mutual
+                # exclusion was a conservative gate, not a structural limit.
+                # The radix tree itself is spec-aware (bigram keys, spec-tail
+                # handling in cache_finished_req); the real hazard was the raw
+                # release path, which the radix-aware routing below fixes.
+                logger.warning(
+                    "EXPERIMENTAL: Decode radix cache together with speculative "
+                    f"decoding (--speculative-algorithm {cfg.speculative_algorithm}). "
+                    "The radix tree uses bigram (EAGLE) keys; prealloc prefix "
+                    "matching, prebuilt caching and finish/retract release all "
+                    "route through the eagle-aware radix paths."
                 )
 
             if resolved_view(server_args).enable_dp_attention:
