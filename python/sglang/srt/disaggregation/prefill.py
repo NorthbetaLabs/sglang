@@ -624,6 +624,11 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.on_idle()
 
+            # PBD handoff fast-path: check for freshly-bootstrapped
+            # requests right after the forward instead of at the next
+            # tick boundary.
+            self._maybe_fast_pop_bootstrapped()
+
             self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
@@ -671,6 +676,11 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # PBD handoff fast-path: check for freshly-bootstrapped
+            # requests right after the forward instead of at the next
+            # tick boundary.
+            self._maybe_fast_pop_bootstrapped()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -872,6 +882,31 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _maybe_fast_pop_bootstrapped(self: Scheduler) -> None:
+        """PBD handoff fast-path: pick up freshly-bootstrapped requests
+        right after the current chunk's forward instead of waiting for the
+        next event-loop tick boundary.
+
+        Zero-cost when nothing new: a plain int compare against the
+        bootstrap thread's notify counter. When the counter moved, reuse
+        the regular pop_bootstrapped() so batch polling, cross-rank MIN
+        consensus, and the optimistic/finalize state machine stay
+        untouched - this hook only changes WHEN the queue is checked,
+        never HOW readiness is decided.
+        """
+        queue = self.disagg_prefill_bootstrap_queue
+        if queue is None:
+            return
+        kv_manager = queue.kv_manager
+        notify = getattr(kv_manager, "_bootstrap_ready_notify", None)
+        if notify is None:
+            return
+        if notify == self._last_bootstrap_notify:
+            return
+        # New readiness since the last check: run the normal queue pop now.
+        self.waiting_queue.extend(queue.pop_bootstrapped())
+        self._last_bootstrap_notify = notify
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
