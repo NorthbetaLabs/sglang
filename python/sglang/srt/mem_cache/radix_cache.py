@@ -180,10 +180,27 @@ class RadixKey:
 
     def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
+        return self.match_offset(other, 0, page_size=page_size)
+
+    def match_offset(self, other: RadixKey, offset: int, page_size: int = 1) -> int:
+        """``match`` with ``other`` viewed from logical unit ``offset`` onward.
+
+        Tree walks hold one request RadixKey and advance an offset instead of
+        slicing a new RadixKey per node: a slice costs an O(n) token-array
+        copy, and on a fragmented tree (page-granular splits) a 900K-token
+        walk spent ~570ms just re-copying the tail on every step. Same
+        semantics and rounding as ``match``; ``other`` must not be bigram
+        when used from a walk (bigram keys never reach tree walks).
+        """
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(len(t0), len(t1))
+        if other.is_bigram:
+            # Logical-unit offset maps to raw tokens one-to-one plus the
+            # boundary token; slice views must own that mapping, so fall
+            # back to the sliced path (bigram keys are draft-model sized).
+            return self.match(other[offset:], page_size=page_size)
+        n = min(len(t0), len(t1) - offset)
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
@@ -193,10 +210,10 @@ class RadixKey:
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
-            if t0[lo:hi] != t1[lo:hi]:
+            if t0[lo:hi] != t1[offset + lo : offset + hi]:
                 while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if t0[lo:mid] == t1[lo:mid]:
+                    if t0[lo:mid] == t1[offset + lo : offset + mid]:
                         lo = mid
                     else:
                         hi = mid
@@ -206,13 +223,28 @@ class RadixKey:
             step *= 2
 
         if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
-        matched_tokens = min(matched_tokens, len(self), len(other))
+        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
         if page_size == 1:
             return matched_tokens
         return (matched_tokens // page_size) * page_size
+
+    def child_key_offset(self, offset: int, page_size: int = 1):
+        """``child_key`` of the view from logical unit ``offset`` onward,
+        without materializing the slice."""
+        t = self.token_ids
+        if self.is_bigram:
+            if page_size == 1:
+                plain = (t[offset], t[offset + 1])
+            else:
+                plain = tuple((t[offset + j], t[offset + j + 1]) for j in range(page_size))
+        else:
+            plain = t[offset] if page_size == 1 else tuple(t[offset : offset + page_size])
+        if self.cache_salt is not None:
+            return ((self.extra_key, self.cache_salt), plain)
+        return plain if self.extra_key is None else (self.extra_key, plain)
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -680,13 +712,21 @@ class RadixCache(BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
-        child_key = key.child_key(self.page_size)
+        # Walk with a logical-unit offset instead of slicing `key[prefix_len:]`
+        # per step: each slice copies the remaining O(n) token array, and on a
+        # fragmented tree (page-granular splits from partial hits) one 900K
+        # request spent ~570ms just re-copying the tail (74x the walk itself).
+        # Bigram views slice inside match_offset (draft-model keys are small).
+        key_len = len(key)
+        offset = 0
+
+        child_key = key.child_key_offset(offset, self.page_size)
 
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while offset < key_len and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_offset(key, offset, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -695,10 +735,10 @@ class RadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                offset += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if offset < key_len:
+                    child_key = key.child_key_offset(offset, self.page_size)
 
         return value, node
 
@@ -753,16 +793,24 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return 0, node
 
-        child_key = key.child_key(self.page_size)
+        # Offset-based walk, mirroring _match_prefix_helper: no per-step
+        # O(n) RadixKey slices on long requests. `value` slicing stays --
+        # it mirrors the matched length and its base is the batch-local tensor.
+        key_len = len(key)
+        is_bigram = key.is_bigram
+        offset = 0
+        value_offset = 0
+
+        child_key = key.child_key_offset(0, self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while offset < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match_offset(key, offset, page_size=self.page_size)
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            value = value[prefix_len:]
+            offset += prefix_len
+            value_offset += prefix_len
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -772,17 +820,17 @@ class RadixCache(BasePrefixCache):
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if offset < key_len:
+                child_key = key.child_key_offset(offset, self.page_size)
 
-        if len(key):
+        if offset < key_len:
             new_node = TreeNode(priority=priority)
             new_node.parent = node
-            new_node.key = key
-            new_node.value = value.clone()
+            new_node.key = key[offset:]
+            new_node.value = value[value_offset:].clone()
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
-            self.evictable_size_ += len(key)
+            self.evictable_size_ += len(key) - offset
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission

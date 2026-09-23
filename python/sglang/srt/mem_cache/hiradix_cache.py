@@ -1822,15 +1822,19 @@ class HiRadixCache(RadixCache):
         if len(key) == 0:
             return 0
 
-        child_key = key.child_key(self.page_size)
+        # Offset-based walk (see RadixKey.match_offset): no O(n) key slices.
+        key_len = len(key)
+        offset = 0
+        host_offset = 0
+        child_key = key.child_key_offset(offset, self.page_size)
 
         matched_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while offset < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            prefix_len = node.key.match(key, page_size=self.page_size)
-            key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
+            prefix_len = node.key.match_offset(key, offset, page_size=self.page_size)
+            offset += prefix_len
+            host_offset += prefix_len
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
@@ -1838,15 +1842,15 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if offset < key_len:
+                child_key = key.child_key_offset(offset, self.page_size)
 
-        if len(key):
+        if offset < key_len:
             new_node = TreeNode(priority=node.priority)
             new_node.parent = node
-            new_node.key = key
+            new_node.key = key[offset:]
             new_node.value = None
-            new_node.host_value = host_value.clone()
+            new_node.host_value = host_value[host_offset:].clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
             self._update_host_leaf_status(new_node)
@@ -1860,13 +1864,18 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
-        child_key = key.child_key(self.page_size)
+        # Offset-based walk (see RadixKey.match_offset): no per-step O(n)
+        # key slices. On a fragmented tree one 900K-token request spent
+        # ~570ms re-copying the remaining tail on every step.
+        key_len = len(key)
+        offset = 0
+        child_key = key.child_key_offset(offset, self.page_size)
         value = []
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while offset < key_len and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_offset(key, offset, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -1877,10 +1886,10 @@ class HiRadixCache(RadixCache):
                 if not child.evicted:
                     value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                offset += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if offset < key_len:
+                    child_key = key.child_key_offset(offset, self.page_size)
 
         return value, node
 
@@ -1936,20 +1945,25 @@ class HiRadixCache(RadixCache):
             return InsertResult(prefix_len=0)
 
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        # Offset-based walk (see RadixKey.match_offset): avoids an O(n)
+        # key-slice copy per step on long inserts. `value` slicing mirrors
+        # the matched length; its base is the batch-local tensor.
+        key_len = len(key)
+        offset = 0
+        child_key = key.child_key_offset(offset, self.page_size)
         total_prefix_length = 0
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while offset < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             node.priority = max(node.priority, priority)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match_offset(key, offset, page_size=self.page_size)
 
             if prefix_len == len(node.key):
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len].clone()
+                    node.value = value[offset : offset + prefix_len].clone()
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
@@ -1964,7 +1978,7 @@ class HiRadixCache(RadixCache):
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
-                    new_node.value = value[:prefix_len].clone()
+                    new_node.value = value[offset : offset + prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
@@ -1975,19 +1989,18 @@ class HiRadixCache(RadixCache):
                     total_prefix_length += prefix_len
                 node = new_node
 
-            key = key[prefix_len:]
-            value = value[prefix_len:]
+            offset += prefix_len
 
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if offset < key_len:
+                child_key = key.child_key_offset(offset, self.page_size)
 
-        if len(key):
+        if offset < key_len:
             new_node = TreeNode(priority=priority)
             new_node.parent = node
-            new_node.key = key
-            new_node.value = value.clone()
+            new_node.key = key[offset:]
+            new_node.value = value[offset:].clone()
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            self.evictable_size_ += len(value) - offset
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
 
