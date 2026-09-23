@@ -65,10 +65,13 @@ from sglang.srt.disaggregation.utils import (
     get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_mla_backend,
+    _apply_metadata_gate,
+    _consensus_by_rid,
+    _poll_with_failure_injection,
     is_unadmitted_reject,
     poll_and_all_reduce,
+    poll_and_all_reduce_by_rid,
     poll_and_all_reduce_pp,
-    poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -2390,6 +2393,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        # RIDs recently failed/aborted out of this queue, kept for a few poll
+        # rounds so rid-keyed consensus can propagate the abort to peers whose
+        # queue position for the request may have shifted or not exist yet.
+        self._aborted_rids: deque = deque()
+        self._aborted_rid_rounds: dict = {}
+
+    _ABORT_RID_TTL_ROUNDS = 8
+
+    def _note_aborted_rid(self, rid: str) -> None:
+        """Record a rid as failed-on-this-rank for the next few poll rounds."""
+        if rid not in self._aborted_rid_rounds:
+            self._aborted_rids.append(rid)
+        self._aborted_rid_rounds[rid] = self._ABORT_RID_TTL_ROUNDS
+
+    def _recent_abort_rids(self) -> List[str]:
+        """Tick down and return rids still inside the propagation window."""
+        expired = [rid for rid, n in self._aborted_rid_rounds.items() if n <= 1]
+        for rid in expired:
+            self._aborted_rid_rounds.pop(rid, None)
+        for rid in self._aborted_rids:
+            if rid in self._aborted_rid_rounds:
+                self._aborted_rid_rounds[rid] -= 1
+        # Drop deque entries whose TTL is gone (deque order = insertion order).
+        while self._aborted_rids and self._aborted_rids[0] not in self._aborted_rid_rounds:
+            self._aborted_rids.popleft()
+        return list(self._aborted_rid_rounds.keys())
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2580,19 +2609,55 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
-        return poll_and_all_reduce(
+        # RID-keyed consensus: ranks can hold divergent transfer queues
+        # (independent admission budgets, abort timing). Positional
+        # all_reduce crashes the engine when lengths disagree; per-rid MIN
+        # turns divergence into a wait instead. Recent aborts propagate so
+        # peers fail the same request deterministically.
+        return poll_and_all_reduce_by_rid(
             pollers,
+            [decode_req.req.rid for decode_req in self.queue],
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
+            recent_aborts=self._recent_abort_rids(),
         )
 
     def _poll_with_staging(self) -> list:
-        return poll_and_all_reduce_with_staging(
-            self.queue,
-            self.staging_handler,
+        # RID-keyed for the same divergence-immunity reasons as
+        # _poll_with_metadata_gate. Staging semantics preserved: advance the
+        # scatter for unfinished staging transfers, demote timed-out staging
+        # to Failed and not-yet-done Success to Transferring, then merge the
+        # local states with peers per rid.
+        for decode_req in self.queue:
+            if decode_req.kv_receiver.require_staging and not self.staging_handler.is_done(
+                decode_req
+            ):
+                self.staging_handler.advance_scatter(decode_req)
+
+        pollers = [dr.kv_receiver for dr in self.queue]
+        polls = _poll_with_failure_injection(pollers)
+        for i, decode_req in enumerate(self.queue):
+            if decode_req.kv_receiver.require_staging and self.staging_handler.is_failed(
+                decode_req
+            ):
+                # Staging completion timed out; Failed is the MIN identity.
+                polls[i] = int(KVPoll.Failed)
+                continue
+            if polls[i] == int(KVPoll.Success):
+                if (
+                    decode_req.kv_receiver.require_staging
+                    and not self.staging_handler.is_done(decode_req)
+                ):
+                    polls[i] = int(KVPoll.Transferring)
+
+        rids = [decode_req.req.rid for decode_req in self.queue]
+        _apply_metadata_gate(polls, self.queue, self.metadata_buffers)
+        return _consensus_by_rid(
+            dict(zip(rids, polls)),
             self.gloo_group,
-            metadata_buffers=self.metadata_buffers,
+            recent_aborts=self._recent_abort_rids(),
+            expected_rids=rids,
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -2662,6 +2727,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     logger.debug(error_message)
                 else:
                     logger.error(error_message)
+                # Register the abort for rid-keyed consensus so peers converge
+                # on Failed for this request instead of racing their own poll.
+                self._note_aborted_rid(decode_req.req.rid)
                 prepare_abort(
                     decode_req.req,
                     error_message,

@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
+    Dict,
     Iterable,
     List,
     Literal,
@@ -189,13 +190,102 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
-    """MIN-reduce poll states so no rank commits ahead of its peers."""
-    if dist.get_world_size(group) == 1:
-        return polls
+    """MIN-reduce poll states so no rank commits ahead of its peers.
 
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
+    Defensive against cross-rank length divergence: every TP rank derives
+    its queue length from independent admission decisions (hicache restore
+    budgets, retract state, abort timing), so the positional zip below can
+    legitimately disagree in flight. gloo aborts the whole process
+    (EnforceNotMet: nbytes mismatch) when tensor lengths differ, which took
+    down decode workers in production. Pad to the max length with
+    KVPoll.Failed — a poll slot that only exists on some ranks is a request
+    another rank has already failed or never admitted; Failed is the MIN
+    identity for every real poll and lets callers abort per-request instead
+    of crashing the engine. Every caller truncates back to its own length.
+    """
+    local_len = len(polls)
+    if local_len == 0:
+        # Nothing on this rank. Still join the collective so peers holding
+        # slots see Failed for the phantom positions; a length exchange is
+        # required for that, so go through the padded path unconditionally.
+        pass
+    len_tensor = torch.tensor([local_len], dtype=torch.int64, device="cpu")
+    dist.all_reduce(len_tensor, op=dist.ReduceOp.MAX, group=group)
+    max_len = int(len_tensor.item())
+    if max_len == 0:
+        return polls
+    padded = torch.full((max_len,), int(KVPoll.Failed), dtype=torch.uint8)
+    if local_len:
+        padded[:local_len] = torch.as_tensor(polls, dtype=torch.uint8)
+    dist.all_reduce(padded, op=dist.ReduceOp.MIN, group=group)
+    return padded[:local_len].tolist()
+
+
+def poll_and_all_reduce_by_rid(
+    pollers,
+    rids: List[str],
+    gloo_group: dist.ProcessGroup,
+    decode_reqs=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    recent_aborts: Optional[Iterable[str]] = None,
+) -> List[int]:
+    """RID-keyed consensus poll, immune to cross-rank queue divergence.
+
+    Positional `poll_and_all_reduce` assumes every TP rank holds an
+    identical queue in identical order. That invariant can break transiently
+    (independent admission budgets, abort timing). Instead of relying on it,
+    each rank publishes `{rid: poll}` for its own queue plus the rids it
+    just aborted; all_gather_object merges the maps and every rid gets the
+    MIN poll across ranks. Requests absent from a peer's queue are seen as
+    WaitingForInput there — "peer has not admitted it yet" is a wait state,
+    not a failure, so a rank never commits a request ahead of its peers and
+    never aborts a request its peers still hold. Genuine failures propagate
+    through the recent-aborts set.
+    """
+    # at a certain prob, the poll is failed to simulate failure
+    polls = _poll_with_failure_injection(pollers)
+
+    # Apply metadata gate on the decode requests to downgrade Success →
+    # Transferring for requests whose metadata hasn't landed.
+    if decode_reqs is not None and metadata_buffers is not None:
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+
+    return _consensus_by_rid(
+        dict(zip(rids, polls)),
+        gloo_group,
+        recent_aborts=recent_aborts,
+        expected_rids=rids,
+    )
+
+
+def _consensus_by_rid(
+    local_map: Dict[str, int],
+    gloo_group: dist.ProcessGroup,
+    recent_aborts: Optional[Iterable[str]] = None,
+    expected_rids: Optional[List[str]] = None,
+) -> List[int]:
+    """Merge per-rank {rid: poll} maps by MIN; absent rids read as
+    WaitingForInput; recent aborts force Failed. Returns polls ordered as
+    `expected_rids` (default: this rank's own rids)."""
+    local_payload = (local_map, {rid for rid in (recent_aborts or ())})
+    gathered = [None] * dist.get_world_size(gloo_group)
+    dist.all_gather_object(gathered, local_payload, group=gloo_group)
+
+    merged: Dict[str, int] = {}
+    aborts: set = set()
+    for peer_map, peer_aborts in gathered:
+        aborts.update(peer_aborts)
+        for rid, p in peer_map.items():
+            merged[rid] = min(merged.get(rid, int(KVPoll.Success)), p)
+    for rid in merged:
+        if rid in aborts:
+            merged[rid] = int(KVPoll.Failed)
+
+    if expected_rids is None:
+        expected_rids = list(local_map.keys())
+    return [
+        merged.get(rid, int(KVPoll.Failed)) for rid in expected_rids
+    ]
 
 
 def poll_and_all_reduce(
@@ -225,41 +315,6 @@ def poll_and_all_reduce_attn_cp_tp_group(
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
     return _all_reduce_polls(polls, attn_cp_cpu_group)
-
-
-def poll_and_all_reduce_with_staging(
-    decode_reqs,
-    staging_handler,
-    gloo_group: dist.ProcessGroup,
-    metadata_buffers: Optional[MetadataBuffers] = None,
-):
-    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
-    for decode_req in decode_reqs:
-        if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-            decode_req
-        ):
-            staging_handler.advance_scatter(decode_req)
-
-    # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
-    for i, decode_req in enumerate(decode_reqs):
-        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
-            decode_req
-        ):
-            # Staging completion timed out; KVPoll.Failed == 0 propagates
-            # through the MIN all_reduce.
-            raw_polls[i] = int(KVPoll.Failed)
-            continue
-        if raw_polls[i] == int(KVPoll.Success):
-            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-                decode_req
-            ):
-                raw_polls[i] = int(KVPoll.Transferring)
-    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
-    if metadata_buffers is not None:
-        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
 
 
 #########################
