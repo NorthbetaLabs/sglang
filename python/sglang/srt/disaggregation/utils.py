@@ -16,6 +16,9 @@ from typing import (
     overload,
 )
 
+import logging
+import threading
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -27,7 +30,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_spec,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -48,6 +51,13 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+logger = logging.getLogger(__name__)
+
+# Bounded wait for TP consensus collectives; on timeout the caller degrades
+# to conservative local polls instead of deadlocking (2026-09-24 incident).
+_CONSENSUS_COLLECTIVE_TIMEOUT_S = 30.0
+_STALE_GATHER_FLAGS: dict = {}
+_IS_HIP = is_hip()
 
 
 def poll_and_all_reduce_pp(
@@ -266,10 +276,64 @@ def _consensus_by_rid(
 ) -> List[int]:
     """Merge per-rank {rid: poll} maps by MIN; absent rids read as
     WaitingForInput; recent aborts force Failed. Returns polls ordered as
-    `expected_rids` (default: this rank's own rids)."""
+    `expected_rids` (default: this rank's own rids).
+
+    Deadlock safety net (2026-09-24 incident): a peer rank can be inside a
+    DIFFERENT TP-collective (e.g. unified_radix_cache.loading_check's
+    all_reduce) while this rank waits in this all_gather_object — gloo then
+    blocks both forever because the collectives interleave in mismatched
+    order. Wrap the gather with a bounded wait: on timeout, degrade to the
+    local polls (conservative — every local request reads Transferring, so no
+    rank commits ahead of peers) and log loudly. The next tick re-attempts
+    consensus; a persistently diverged peer eventually shows up in its own
+    collective or its watchdog fires, and this rank keeps making progress.
+    """
     local_payload = (local_map, {rid for rid in (recent_aborts or ())})
     gathered = [None] * dist.get_world_size(gloo_group)
-    dist.all_gather_object(gathered, local_payload, group=gloo_group)
+
+    # torch does not expose a timeout on all_gather_object; run the collective
+    # in a helper thread and degrade to local polls if peers do not join in
+    # time. After a timeout the stale helper may still hold the collective
+    # open, so further ticks skip the collective until it completes —
+    # otherwise a second gather interleaving with the stale one would wedge
+    # gloo's send/recv sequence permanently.
+    done = threading.Event()
+    result: List[Any] = [None]
+
+    def _gather():
+        try:
+            out: List[Any] = [None] * dist.get_world_size(gloo_group)
+            dist.all_gather_object(out, local_payload, group=gloo_group)
+            result[0] = out
+        except Exception:
+            result[0] = None
+        finally:
+            done.set()
+            _STALE_GATHER_FLAGS[gloo_group] = False
+
+    if _STALE_GATHER_FLAGS.get(gloo_group, False):
+        # A previous gather on this group timed out and its helper thread is
+        # still parked inside the collective. Degrade without enqueueing
+        # another gather.
+        logger.warning("rid-consensus degraded: stale gather still pending on group")
+        return [int(KVPoll.Transferring)] * len(expected_rids or list(local_map.keys()))
+
+    t = threading.Thread(target=_gather, daemon=True)
+    _STALE_GATHER_FLAGS[gloo_group] = True
+    t.start()
+    if not done.wait(timeout=_CONSENSUS_COLLECTIVE_TIMEOUT_S):
+        logger.error(
+            "rid-consensus all_gather_object timed out after %.0fs "
+            "(peer rank likely diverged into a different TP-collective; "
+            "degrading to local polls this tick)",
+            _CONSENSUS_COLLECTIVE_TIMEOUT_S,
+        )
+        # Conservative degrade: all local requests stay Transferring.
+        return [int(KVPoll.Transferring)] * len(expected_rids or list(local_map.keys()))
+    if result[0] is None:
+        raise RuntimeError("rid-consensus all_gather_object failed")
+
+    gathered = result[0]
 
     merged: Dict[str, int] = {}
     aborts: set = set()
