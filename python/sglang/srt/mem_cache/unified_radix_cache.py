@@ -3343,6 +3343,21 @@ class UnifiedRadixCache(BasePrefixCache):
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
             self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
+    def loading_check_local(self) -> None:
+        """Drain only acks whose finish_event has fired on this rank.
+
+        Collective-free variant of ``loading_check`` for callsites whose
+        reach depends on per-rank state (is_load_back_event_done). The
+        authoritative cross-rank sync (finish_count/digest) lives in the
+        per-tick check_hicache_events path, which all ranks enter.
+        """
+        cc = self.cache_controller
+        if cc is None:
+            return
+        finish_count = self._count_ready_acks(cc.ack_load_queue)
+        if finish_count > 0:
+            self.loading_check(finish_count=finish_count)
+
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
@@ -3540,7 +3555,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if not finish_event.query():
             return False
 
-        self.loading_check()
+        # Consume only LOCAL completed acks. The all-reduce variant
+        # (loading_check with no finish_count) is intentionally NOT used
+        # here: this call site is reached only by ranks that happen to hold a
+        # PENDING restore request, so ranks enter the collective
+        # conditionally and can interleave with other TP collectives — the
+        # cross-callsite deadlock of the 2026-09-24 incidents. Cross-rank
+        # ordering (finish_count/digest sync) stays in the per-tick
+        # check_hicache_events, which every rank enters unconditionally.
+        self.loading_check_local()
         return True
 
     # ---- Query / Inspection APIs ----
