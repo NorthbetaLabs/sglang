@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
+    poll_and_all_reduce_attn_cp_tp_group_by_rid,
     poll_and_all_reduce_pp,
     prepare_abort,
     setup_state_kv_args,
@@ -489,8 +490,13 @@ class PrefillBootstrapQueue:
                     if local_poll == KVPoll.Failed:
                         polls[i] = KVPoll.Failed
         else:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
+            # RID-keyed consensus: per-rank admission order can make positional
+            # polls diverge across CP ranks (same hazard class as the D-side
+            # incidents of 2026-09-24/25); merge by rid with wait-on-absent
+            # semantics instead.
+            polls = poll_and_all_reduce_attn_cp_tp_group_by_rid(
                 [req.disagg_kv_sender for req in self.queue],
+                [req.rid for req in self.queue],
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
             )
@@ -605,8 +611,9 @@ class SchedulerDisaggregationPrefillMixin:
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
         if not candidates:
             return
-        polls = poll_and_all_reduce_attn_cp_tp_group(
+        polls = poll_and_all_reduce_attn_cp_tp_group_by_rid(
             [req.disagg_kv_sender for req in candidates],
+            [req.rid for req in candidates],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )

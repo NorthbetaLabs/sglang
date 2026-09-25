@@ -317,6 +317,30 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
+def poll_and_all_reduce_attn_cp_tp_group_by_rid(
+    pollers,
+    rids: List[str],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+):
+    """RID-keyed CP+TP consensus for P-side bootstrap polls.
+
+    The positional variant above assumes every CP rank holds the same queue in
+    the same order; admission is per-rank, so that invariant can break the same
+    way the D-side queues did (2026-09-24/25 incidents). This variant merges
+    per-rid polls by MIN through all_gather_object on each group; a rid absent
+    from a peer reads as WaitingForInput (wait, not fail). Requests a rank no
+    longer holds (already popped after success) simply stop being reported.
+    """
+    local_polls = _poll_with_failure_injection(pollers)
+    tp_merged = _consensus_by_rid(
+        dict(zip(rids, local_polls)), attn_tp_cpu_group, expected_rids=rids
+    )
+    return _consensus_by_rid(
+        dict(zip(rids, tp_merged)), attn_cp_cpu_group, expected_rids=rids
+    )
+
+
 #########################
 # Metadata Buffers
 #########################
