@@ -270,8 +270,39 @@ class _SelectorDraftSampler:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
             return
+        # Defensive sizing: under relaxed accept thresholds (e.g. 0.7) the verify
+        # batch composition can transiently exceed the prepared sampling_info rows
+        # (observed bs=65 vs temperatures rows=64 -> RuntimeError killing the
+        # scheduler). Stage what is available and pad the remainder with the last
+        # request's params; the next tick rebuilds sampling_info and self-heals.
+        temps = sampling_info.temperatures.view(-1)
+        if len(temps) < bs:
+            logger.warning(
+                "dflash draft sampler: sampling_info rows (%d) < bs (%d); "
+                "padding with last row (batch will self-heal next prepare)",
+                len(temps), bs,
+            )
+            n = len(temps)
+            torch.clamp(
+                temps.to(torch.float32),
+                min=1e-5,
+                out=self.temperatures[:n],
+            )
+            if n > 0:
+                self.temperatures[n:bs].copy_(self.temperatures[n - 1].unsqueeze(0))
+            else:
+                self.temperatures[:bs].fill_(1.0)
+            mask = resolve_greedy_mask(
+                bs=n, sampling_info=sampling_info, device=self.greedy_mask.device
+            )
+            self.greedy_mask[:n].copy_(mask)
+            if n > 0:
+                self.greedy_mask[n:bs].copy_(self.greedy_mask[n - 1].unsqueeze(0))
+            else:
+                self.greedy_mask[:bs].fill_(True)
+            return
         torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            temps[:bs].to(torch.float32),
             min=1e-5,
             out=self.temperatures[:bs],
         )
