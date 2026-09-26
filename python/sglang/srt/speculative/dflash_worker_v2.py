@@ -265,52 +265,43 @@ class _SelectorDraftSampler:
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
-        graph replay that consumes them."""
+        graph replay that consumes them.
+
+        Defensive sizing: under relaxed accept thresholds the verify batch
+        composition can transiently exceed the prepared sampling_info rows
+        (observed bs=65 vs sampling_info rows=64 across temperatures AND
+        top_ks -> RuntimeError killing the scheduler). Every consumer here is
+        sized from the actual sampling_info row count and padded with the
+        last request's params; the next tick rebuilds sampling_info and
+        self-heals.
+        """
         if sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
             return
-        # Defensive sizing: under relaxed accept thresholds (e.g. 0.7) the verify
-        # batch composition can transiently exceed the prepared sampling_info rows
-        # (observed bs=65 vs temperatures rows=64 -> RuntimeError killing the
-        # scheduler). Stage what is available and pad the remainder with the last
-        # request's params; the next tick rebuilds sampling_info and self-heals.
         temps = sampling_info.temperatures.view(-1)
-        if len(temps) < bs:
+        n = min(len(temps), bs)
+        if n < bs:
             logger.warning(
                 "dflash draft sampler: sampling_info rows (%d) < bs (%d); "
                 "padding with last row (batch will self-heal next prepare)",
                 len(temps), bs,
             )
-            n = len(temps)
+        if n > 0:
             torch.clamp(
-                temps.to(torch.float32),
+                temps[:n].to(torch.float32),
                 min=1e-5,
                 out=self.temperatures[:n],
             )
-            if n > 0:
-                self.temperatures[n:bs].copy_(self.temperatures[n - 1].unsqueeze(0))
-            else:
-                self.temperatures[:bs].fill_(1.0)
+            self.temperatures[n:bs].copy_(self.temperatures[n - 1].unsqueeze(0))
             mask = resolve_greedy_mask(
                 bs=n, sampling_info=sampling_info, device=self.greedy_mask.device
             )
             self.greedy_mask[:n].copy_(mask)
-            if n > 0:
-                self.greedy_mask[n:bs].copy_(self.greedy_mask[n - 1].unsqueeze(0))
-            else:
-                self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            temps[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
-            )
-        )
+            self.greedy_mask[n:bs].copy_(self.greedy_mask[n - 1].unsqueeze(0))
+        else:
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
