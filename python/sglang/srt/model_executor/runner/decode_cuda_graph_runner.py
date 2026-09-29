@@ -860,9 +860,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE is set. In per-bs mode
         # (SGLANG_GRAPH_BATCH_CAPTURE) that env is unset, so this stays a no-op
         # and the per-bs on_trace_ready handles export instead.
+        # Target and draft workers both instantiate this runner class; keep
+        # their capture traces from clobbering each other by role-prefixing
+        # the file name (draft capture runs later and would otherwise
+        # overwrite the target-verify trace of the same TP rank).
+        _role = "draft" if getattr(self.model_runner, "is_draft_worker", False) else "target"
         export_cuda_graph_capture_trace(
             prof_context,
-            runner_name=type(self).__name__,
+            runner_name=f"{_role}-{type(self).__name__}",
             tp_rank=get_parallel().tp_rank,
         )
 
