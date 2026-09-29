@@ -387,6 +387,79 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
+def broadcast_decode_prefix_len_by_rid(
+    local_map: Dict[str, int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    expected_rids: List[str],
+) -> List[int]:
+    """Share decode-reported prefix lengths across the attention-CP group.
+
+    The decode worker returns its radix-cache hit length via send_metadata,
+    which in the default (non-all-CP) topology only reaches prefill CP rank 0
+    (decode resolves target CP ranks truncated to [:1]). Every CP rank still
+    runs its own finalize_bootstrap and must consume the same length, or its
+    start_send_idx desynchronizes and the room re-transfers the full KV.
+
+    Merge per-rank {rid: len} maps by MAX through one all_gather_object per
+    tick: rank 0 carries the decode value while peers hold 0, so MAX is the
+    value; if the gather times out (peer diverged into another collective,
+    same hazard class as the 09-24 incidents), degrade to all-zeros —
+    conservative, the worst case is a full transfer, never a wrong skip.
+
+    Returns lengths ordered as `expected_rids`; rids a rank does not know
+    read as 0.
+    """
+    local_payload = {rid: int(local_map.get(rid, 0)) for rid in expected_rids}
+    gathered: List[Any] = [None] * dist.get_world_size(attn_cp_cpu_group)
+
+    done = threading.Event()
+    result: List[Any] = [None]
+
+    def _gather():
+        try:
+            out: List[Any] = [None] * dist.get_world_size(attn_cp_cpu_group)
+            dist.all_gather_object(out, local_payload, group=attn_cp_cpu_group)
+            result[0] = out
+        except Exception:
+            result[0] = None
+        finally:
+            done.set()
+            _STALE_GATHER_FLAGS[attn_cp_cpu_group] = False
+
+    if _STALE_GATHER_FLAGS.get(attn_cp_cpu_group, False):
+        logger.warning(
+            "prefix-len broadcast degraded: stale gather still pending on group"
+        )
+        return [0] * len(expected_rids)
+
+    t = threading.Thread(target=_gather, daemon=True)
+    _STALE_GATHER_FLAGS[attn_cp_cpu_group] = True
+    t.start()
+    if not done.wait(timeout=_CONSENSUS_COLLECTIVE_TIMEOUT_S):
+        logger.error(
+            "prefix-len broadcast all_gather_object timed out after %.0fs "
+            "(degrading to full transfer for this tick)",
+            _CONSENSUS_COLLECTIVE_TIMEOUT_S,
+        )
+        return [0] * len(expected_rids)
+    if result[0] is None:
+        raise RuntimeError("prefix-len broadcast all_gather_object failed")
+
+    merged = []
+    for rid in expected_rids:
+        merged.append(
+            max(
+                (
+                    int(payload.get(rid, 0))
+                    for payload in result[0]
+                    if isinstance(payload, dict)
+                ),
+                default=0,
+            )
+        )
+    return merged
+
+
 def poll_and_all_reduce_attn_cp_tp_group_by_rid(
     pollers,
     rids: List[str],

@@ -1301,7 +1301,14 @@ class CommonKVSender(BaseKVSender):
         )
 
     def pop_decode_prefix_len(self) -> int:
-        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+        # Every TP rank of the room's sender group calls this during its own
+        # finalize_bootstrap; a destructive pop would hand the decode-reported
+        # prefix length to whichever rank races first and 0 to the rest,
+        # desynchronizing start_send_idx and forcing a full re-transfer on the
+        # ranks that lost the race. Peek instead: the manager already removes
+        # the entry when the room's transfer completes (MooncakeKVManager
+        # chunk-finished cleanup), and rooms are never reused.
+        return int(self.kv_mgr.req_to_decode_prefix_len.get(self.bootstrap_room, 0))
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk

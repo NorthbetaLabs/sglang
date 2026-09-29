@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -154,6 +154,10 @@ class PrefillBootstrapQueue:
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        # rid -> decode-reported prefix length shared across the CP group
+        # each tick (only CP rank 0 hears send_metadata in the default
+        # topology; see pop_bootstrapped).
+        self._cp_prefix_lens: Dict[str, int] = {}
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -369,11 +373,13 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-        num_kv_indices = len(req.origin_input_ids)
+        decode_prefix_len = self._cp_prefix_lens.pop(req.rid, None)
+        if decode_prefix_len is None:
+            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
+        num_kv_indices = len(req.origin_input_ids)
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
             num_kv_indices_to_send,
@@ -461,6 +467,34 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
+        # Share the decode-reported prefix length across the CP group before
+        # any rank finalizes: only CP rank 0 hears the decode worker's
+        # send_metadata in the default (non-all-CP) topology, but every CP
+        # rank's finalize_bootstrap must set the same start_send_idx or the
+        # room re-transfers the whole KV. One collective per tick over the
+        # requests about to leave the queue keeps this aligned with the
+        # rid-consensus cadence (no per-request collective interleaving).
+        finalize_rids = [
+            req.rid
+            for i, (req, poll) in enumerate(zip(self.queue, polls))
+            if poll == KVPoll.WaitingForInput
+        ]
+        from sglang.srt.runtime_context import get_parallel
+        if finalize_rids and get_parallel().attn_cp_size > 1:
+            from sglang.srt.disaggregation.utils import (
+                broadcast_decode_prefix_len_by_rid,
+            )
+
+            local_lens = {
+                req.rid: req.disagg_kv_sender.pop_decode_prefix_len()
+                for i, req in enumerate(self.queue)
+                if polls[i] == KVPoll.WaitingForInput
+            }
+            shared = broadcast_decode_prefix_len_by_rid(
+                local_lens, self.scheduler.attn_cp_cpu_group, finalize_rids
+            )
+            for req, plen in zip(finalize_rids, shared):
+                self._cp_prefix_lens[req] = plen
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
                 continue

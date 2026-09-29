@@ -255,7 +255,7 @@ class DecodeKVCacheOffloadManager:
             from sglang.srt.mem_cache.common import release_kv_cache
 
             release_kv_cache(req, self.tree_cache, is_insert=True)
-            self.offloaded_state.pop(req.rid, None)
+            self.offloaded_state.pop(req, None)
             return
 
         kv_committed_len = req.effective_kv_committed_len()
