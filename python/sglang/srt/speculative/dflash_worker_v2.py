@@ -1832,6 +1832,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                 positions=positions,
             )
 
+            # Single-request passthrough for draft-distillation extraction: the
+            # caller explicitly asked for hidden states, so mirror the packed
+            # 6-layer aux features into the req before the worker-local copy is
+            # dropped. Only the bs==1 path is handled — batched requests keep
+            # the None fast path, and production traffic (return_hidden_states
+            # False) never reaches the copy.
+            if (
+                logits_output.hidden_states is not None
+                and len(batch.reqs) == 1
+                and batch.reqs[0].return_hidden_states
+            ):
+                batch.reqs[0].hidden_states.append(
+                    logits_output.hidden_states.cpu().clone().tolist()
+                )
+
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
 
