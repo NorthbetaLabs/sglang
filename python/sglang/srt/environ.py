@@ -1250,6 +1250,7 @@ class Envs:
     # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_DEEPEP_DISABLE_FABRIC = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
