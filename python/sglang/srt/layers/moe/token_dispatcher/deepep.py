@@ -293,7 +293,12 @@ class DeepEPBuffer:
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
+        # Opt-out for CU13 builds whose fabric handle creation is rejected by
+        # the driver (cuMemCreate status 800 cascades into a fatal NVSHMEM
+        # init failure). The CUDA-IPC fallback is fully functional
+        # single-node; fabric only matters for cross-pod MNNVL groups.
+        _fabric_opt_out = envs.SGLANG_DEEPEP_DISABLE_FABRIC.get()
+        if (not is_cu12) and use_mnnvl_fabric and not _fabric_opt_out:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
