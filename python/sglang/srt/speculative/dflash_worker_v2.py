@@ -1832,20 +1832,27 @@ class DFlashWorkerV2(BaseSpecWorker):
                 positions=positions,
             )
 
-            # Single-request passthrough for draft-distillation extraction: the
-            # caller explicitly asked for hidden states, so mirror the packed
-            # 6-layer aux features into the req before the worker-local copy is
-            # dropped. Only the bs==1 path is handled — batched requests keep
-            # the None fast path, and production traffic (return_hidden_states
-            # False) never reaches the copy.
-            if (
-                logits_output.hidden_states is not None
-                and len(batch.reqs) == 1
-                and batch.reqs[0].return_hidden_states
-            ):
-                batch.reqs[0].hidden_states.append(
-                    logits_output.hidden_states.cpu().clone().tolist()
-                )
+            # Draft-distillation extraction passthrough: for requests that
+            # explicitly asked for hidden states, mirror the packed 6-layer
+            # aux features before the worker-local copy is dropped. Batched
+            # prefills are sliced per request by extend length so concurrent
+            # extraction traffic (which self-batches) still gets its data.
+            # Production traffic (return_hidden_states falsy) never enters.
+            if logits_output.hidden_states is not None:
+                wants = [i for i, r in enumerate(batch.reqs) if r.return_hidden_states]
+                if wants:
+                    hs_all = logits_output.hidden_states.cpu().clone()
+                    lens = [int(x) for x in batch.extend_lens]
+                    if len(lens) == len(batch.reqs):
+                        off = 0
+                        for i in wants:
+                            req = batch.reqs[i]
+                            req.hidden_states.append(
+                                hs_all[off:off + lens[i]].tolist()
+                            )
+                            off += lens[i]
+                    elif len(batch.reqs) == 1:
+                        batch.reqs[0].hidden_states.append(hs_all.tolist())
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
