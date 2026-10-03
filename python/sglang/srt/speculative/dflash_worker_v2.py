@@ -374,6 +374,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if hasattr(target_model, "get_dflash_noise_embedding_scale")
             else 1.0
         )
+        self.selector.return_path_indices = envs.SGLANG_DIST_VERIFY_SOFTMAX.get()
+        self._selector_walk_cols = None
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -1011,15 +1013,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             if sampling_info is None
             else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
         )
-        tokens, q_rows = self.selector.sample_path(
-            candidate_ids=candidate_ids,
-            scores=scores,
-            uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
-            temperatures=temperatures,
-            greedy_mask=resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=device
-            ),
-        )
+        if self.selector.return_path_indices:
+            tokens, q_rows, walk_cols = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
+                temperatures=temperatures,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
+            )
+            self._selector_walk_cols = walk_cols
+        else:
+            tokens, q_rows = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
+                temperatures=temperatures,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
+            )
         if not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
@@ -1064,6 +1078,169 @@ class DFlashWorkerV2(BaseSpecWorker):
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
+        return accept_len.to(torch.int32), bonus.to(torch.int64)
+
+    def _dist_verify_eligible(self, sampling_info) -> bool:
+        """Dist-verify path covers the plain-sampling main flow; requests with
+        grammar/penalties/custom processors fall back to the classic path."""
+        if sampling_info is None:
+            return True
+        return not (
+            getattr(sampling_info, "grammar_mask", None) is not None
+            or getattr(sampling_info, "penalizer_orchestrator", None) is not None
+            or getattr(sampling_info, "logit_bias", None) is not None
+            or getattr(sampling_info, "has_custom_logit_processor", False)
+        )
+
+    def _dist_selector_accept(
+        self,
+        *,
+        candidates: torch.Tensor,      # [bs, block] walked global ids
+        logits_shard: torch.Tensor,   # [bs*block, V/tp] local shard (no AG)
+        candidate_ids: torch.Tensor,  # [bs, slots, K] global candidate ids
+        q_rows: torch.Tensor,         # [bs, slots, K] walk q values
+        walk_cols: torch.Tensor,      # [bs, slots] chosen K-column per step
+        sampling_info,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Accept + bonus sampling on vocab shards (SGLANG_DIST_VERIFY_SOFTMAX).
+
+        Replaces the full-vocab logits all-gather (~900us/step) with:
+          stage-1: all_reduce of shard-local candidate logits (kb-scale) +
+                   global exp-sum denominators (scalar rows)
+          local:   diagonal accept tables -> chain_verify_diagonal
+          stage-2: shard softmax rows rescaled by z_full/z_shard (exact —
+                   exp-sums are additive), then the fragment residual
+                   protocol for the final bonus token (scalar collectives)
+        """
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_verify_diagonal,
+            fragment_residual_sum,
+            fragment_final_locate,
+        )
+
+        bs, block = candidates.shape
+        slots = block - 1
+        device = logits_shard.device
+        tp = get_tp_group()
+        vocab_shard = logits_shard.shape[-1]
+        vocab_start = vocab_shard * tp.rank
+
+        logits2d = logits_shard.view(bs, block, vocab_shard)
+
+        # ---- global denominators (exact: exp-sum additive over shards) ----
+        partial = torch.exp(logits2d.float()).sum(-1)  # [bs, block]
+        z = partial.clone()
+        tp.all_reduce(z, op=torch.distributed.ReduceOp.SUM)
+
+        # ---- stage-1: candidate logits [bs, slots, K] via shard all_reduce ----
+        local_idx = (candidate_ids - vocab_start).clamp(0, vocab_shard - 1)
+        in_shard = (candidate_ids >= vocab_start) & (
+            candidate_ids < vocab_start + vocab_shard
+        )
+        cl = torch.zeros(bs, slots, K, device=device, dtype=torch.float32)
+        # distribution row for step s is block position s-1 (diag semantics)
+        for s in range(1, slots + 1):
+            row = logits2d[:, s - 1, :]
+            cl[:, s - 1, :] = (
+                torch.gather(row, 1, local_idx[:, s - 1, :]) * in_shard[:, s - 1, :]
+            )
+        cand_logits = cl
+        tp.all_reduce(cand_logits, op=torch.distributed.ReduceOp.SUM)
+
+        # ---- diagonal tables ----
+        diag_ps = torch.zeros(bs, slots, device=device, dtype=torch.float32)
+        diag_qs = torch.zeros(bs, slots, device=device, dtype=torch.float32)
+        for s in range(1, slots):
+            # classic reads tp[b, step-1, cand[step]] -> logits row s-1 at
+            # candidate s, i.e. cand_logits[:, s-1, col[s]] — but cand_logits
+            # above is indexed by the (s-1)-th *candidate row*. The (s-1) row
+            # of candidate_ids indexes step s-1's candidates; step s's walked
+            # id is candidates[:, s], whose K-column is walk_cols[:, s].
+            # The logit we need: row s-1 of the DISTRIBUTION at candidates[:, s].
+            cid = candidates[:, s]
+            in_s = (cid >= vocab_start) & (cid < vocab_start + vocab_shard)
+            lidx = (cid - vocab_start).clamp(0, vocab_shard - 1)
+            l_row = (
+                torch.gather(logits2d[:, s - 1, :], 1, lidx.unsqueeze(1)).squeeze(1)
+                * in_s
+            )
+            l_full = l_row.clone()
+            tp.all_reduce(l_full, op=torch.distributed.ReduceOp.SUM)
+            diag_ps[:, s] = torch.exp(l_full) / z[:, s - 1]
+            diag_qs[:, s] = torch.gather(
+                q_rows[:, s - 1, :], 1, walk_cols[:, s].unsqueeze(1).long()
+            ).squeeze(1)
+
+        uni = torch.rand(bs, slots, device=device)
+        retrieve_index = (
+            torch.arange(slots, device=device)
+            .unsqueeze(0)
+            .expand(bs, slots)
+            .contiguous()
+        )
+        predicts, accept_index, accept_len = chain_verify_diagonal(
+            candidates, diag_ps, diag_qs, retrieve_index, uni
+        )
+
+        # ---- stage-2: final bonus token (fragment residual protocol) ----
+        cur_rows = accept_len.clamp(max=slots - 1).to(torch.int64)
+        all_acc = accept_len >= slots
+        coin_final = torch.rand(bs, device=device)
+
+        # shard-local softmax rows, rescaled to the true full distribution:
+        # p_shard * (z_full / z_shard) == p_full, exactly.
+        p_shard = torch.exp(logits2d.float()) / partial.unsqueeze(-1)  # [bs, block, V/tp]
+        # sparse draft shard rows at the tested candidate of the breaking step
+        cid_last = torch.gather(
+            candidates[:, 1:], 1, cur_rows.unsqueeze(1).clamp(max=slots - 1)
+        ).squeeze(1)
+        col_last = torch.gather(walk_cols[:, 1:], 1, cur_rows.unsqueeze(1)).squeeze(1)
+        q_last = torch.gather(
+            q_rows, 1, cur_rows.view(bs, 1, 1).expand(bs, 1, K)
+        ).squeeze(1)
+        q_sel_last = torch.gather(q_last, 1, col_last.unsqueeze(1).long()).squeeze(1)
+        in_l = (cid_last >= vocab_start) & (cid_last < vocab_start + vocab_shard)
+        lidx_l = (cid_last - vocab_start).clamp(0, vocab_shard - 1)
+        dp_shard = torch.zeros(bs, slots, vocab_shard, device=device, dtype=torch.float32)
+        dp_rows = dp_shard[torch.arange(bs, device=device), cur_rows]
+        dp_rows.scatter_(1, lidx_l.unsqueeze(1), q_sel_last.unsqueeze(1) * in_l.unsqueeze(1))
+
+        tp_shard = p_shard[torch.arange(bs, device=device), cur_rows]  # [bs, V/tp]
+        frag_sum = fragment_residual_sum(
+            tp_shard.unsqueeze(1), dp_rows.unsqueeze(1), torch.zeros(bs, device=device, dtype=torch.int64)
+        )
+        z_global = frag_sum.clone()
+        tp.all_reduce(z_global, op=torch.distributed.ReduceOp.SUM)
+        target_u = coin_final * z_global
+
+        gathered = torch.empty(
+            tp.world_size * bs, device=device, dtype=torch.float32
+        )
+        tp.all_gather(gathered, frag_sum)
+        per_rank = gathered.view(tp.world_size, bs)
+        prefix = per_rank[: tp.rank].sum(0) if tp.rank > 0 else torch.zeros(bs, device=device)
+        lower = prefix
+        upper = prefix + frag_sum
+        is_landing = (target_u >= lower) & (target_u < upper)
+        local_u = target_u - prefix
+        offsets = torch.where(
+            is_landing, local_u, torch.full_like(local_u, float("inf"))
+        )
+        found = fragment_final_locate(
+            tp_shard.unsqueeze(1), dp_rows.unsqueeze(1),
+            torch.zeros(bs, device=device, dtype=torch.int64), offsets,
+        )
+        token_global = torch.where(found >= 0, found + vocab_start, torch.zeros_like(found))
+        bonus = token_global.clone()
+        tp.all_reduce(bonus, op=torch.distributed.ReduceOp.MAX)
+
+        # classic degenerate fallback: residual empty -> last vocab id
+        degenerate = z_global <= 0
+        if degenerate.any():
+            bonus = torch.where(
+                degenerate, torch.full_like(bonus, vocab_shard * tp.world_size - 1), bonus
+            )
+
         return accept_len.to(torch.int32), bonus.to(torch.int64)
 
     def _greedy_sample_from_quantized_head(
@@ -1660,7 +1837,25 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         new_seq_lens = None
         target_predict = None
-        if self._selector_sample is not None:
+        if (
+            self._selector_sample is not None
+            and getattr(self.selector, "return_path_indices", False)
+            and self._dist_verify_eligible(sampling_info)
+            and self._selector_walk_cols is not None
+        ):
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus = self._dist_selector_accept(
+                candidates=candidates,
+                logits_shard=next_token_logits,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                walk_cols=self._selector_walk_cols,
+                sampling_info=sampling_info,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
