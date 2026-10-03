@@ -206,3 +206,141 @@ def chain_speculative_sampling_triton(
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
     )
+
+
+# ---------------------------------------------------------------------------
+# Distributed verify softmax: fragment-sharded variants (2026-10-03).
+# Exact math: the global softmax denominator is the sum of per-rank
+# exp-sums; the final-sample CDF is the rank-ordered concatenation of
+# local CDFs (vocab shards are contiguous, ordered by rank).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def fragment_residual_sum_kernel(
+    TargetProbs,
+    DraftProbs,
+    FragmentSum,  # [bs] output: this rank's residual-fragment sum
+    stride_tp_b,
+    stride_tp_s,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    num_steps,
+    cur_prob_rows,  # [bs] which target row each request stopped on
+    VOCAB_SIZE: tl.constexpr,  # size of THIS rank's shard
+    BLOCK_V: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = tl.load(cur_prob_rows + pid).to(tl.int64)
+
+    tp_base = TargetProbs + pid * stride_tp_b + row * stride_tp_s
+    dp_base = DraftProbs + pid * stride_dp_b + row * stride_dp_s
+
+    norm_sum = 0.0
+    for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+        v_offsets = v_start + tl.arange(0, BLOCK_V)
+        mask = v_offsets < VOCAB_SIZE
+        p_val = tl.load(tp_base + v_offsets, mask=mask, other=0.0)
+        q_val = tl.load(dp_base + v_offsets, mask=mask, other=0.0)
+        q_val = tl.where(q_val == q_val, q_val, 0.0)
+        diff = p_val - q_val
+        val = tl.where(diff > 0.0, diff, 0.0)
+        norm_sum += tl.sum(val)
+
+    tl.store(FragmentSum + pid, norm_sum)
+
+
+@triton.jit
+def fragment_final_locate_kernel(
+    TargetProbs,
+    DraftProbs,
+    FoundToken,  # [bs] output: located token's SHARD-LOCAL id, or -1
+    stride_tp_b,
+    stride_tp_s,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    cur_prob_rows,  # [bs]
+    target_u_offsets,  # [bs] uniform*global_norm minus preceding ranks' sums
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = tl.load(cur_prob_rows + pid).to(tl.int64)
+    target_u = tl.load(target_u_offsets + pid)
+
+    tp_base = TargetProbs + pid * stride_tp_b + row * stride_tp_s
+    dp_base = DraftProbs + pid * stride_dp_b + row * stride_dp_s
+
+    cum_sum = 0.0
+    found_token = -1
+    for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+        if found_token == -1:
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+            p_val = tl.load(tp_base + v_offsets, mask=mask, other=0.0)
+            q_val = tl.load(dp_base + v_offsets, mask=mask, other=0.0)
+            q_val = tl.where(q_val == q_val, q_val, 0.0)
+            diff = p_val - q_val
+            val = tl.where(diff > 0.0, diff, 0.0)
+            block_cumsum = tl.cumsum(val, axis=0)
+            total_cumsum = cum_sum + block_cumsum
+            hit = (total_cumsum > target_u) & mask
+            if tl.sum(hit.to(tl.int32)) > 0:
+                local_idx = tl.min(tl.where(hit, v_offsets, VOCAB_SIZE))
+                found_token = local_idx
+            cum_sum += tl.sum(val)
+
+    tl.store(FoundToken + pid, found_token)
+
+
+def fragment_residual_sum(
+    target_probs_shard,   # [bs, slots+1, V/tp]
+    draft_probs_shard,   # [bs, slots, V/tp]
+    cur_prob_rows,        # [bs] int
+) -> torch.Tensor:
+    bs = target_probs_shard.shape[0]
+    vocab = target_probs_shard.shape[-1]
+    out = torch.empty((bs,), dtype=torch.float32, device=target_probs_shard.device)
+    fragment_residual_sum_kernel[(bs,)](
+        target_probs_shard,
+        draft_probs_shard,
+        out,
+        target_probs_shard.stride(0),
+        target_probs_shard.stride(1),
+        draft_probs_shard.stride(0),
+        draft_probs_shard.stride(1),
+        draft_probs_shard.stride(2),
+        target_probs_shard.shape[1] - 1,
+        cur_prob_rows,
+        VOCAB_SIZE=vocab,
+        BLOCK_V=4096,
+    )
+    return out
+
+
+def fragment_final_locate(
+    target_probs_shard,
+    draft_probs_shard,
+    cur_prob_rows,
+    target_u_offsets,
+) -> torch.Tensor:
+    bs = target_probs_shard.shape[0]
+    vocab = target_probs_shard.shape[-1]
+    out = torch.empty((bs,), dtype=torch.int64, device=target_probs_shard.device)
+    fragment_final_locate_kernel[(bs,)](
+        target_probs_shard,
+        draft_probs_shard,
+        out,
+        target_probs_shard.stride(0),
+        target_probs_shard.stride(1),
+        draft_probs_shard.stride(0),
+        draft_probs_shard.stride(1),
+        draft_probs_shard.stride(2),
+        cur_prob_rows,
+        target_u_offsets,
+        VOCAB_SIZE=vocab,
+        BLOCK_V=4096,
+    )
+    return out
