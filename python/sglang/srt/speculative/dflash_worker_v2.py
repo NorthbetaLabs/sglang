@@ -280,13 +280,22 @@ class _SelectorDraftSampler:
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
-        tokens, q_rows = self.selector.sample_path(
-            candidate_ids=candidate_ids,
-            scores=scores,
-            uniforms=self.uniforms[:bs].uniform_(),
-            temperatures=self.temperatures[:bs],
-            greedy_mask=self.greedy_mask[:bs],
-        )
+        if self.selector.return_path_indices:
+            tokens, q_rows, _cols = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+            )
+        else:
+            tokens, q_rows = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+            )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
@@ -1842,6 +1851,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             and getattr(self.selector, "return_path_indices", False)
             and self._dist_verify_eligible(sampling_info)
             and self._selector_walk_cols is not None
+            and bool(getattr(self._draft_block_spec_info, "dist_verify_active", False))
         ):
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._dist_selector_accept(
@@ -2225,6 +2235,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
+
+        # DIST-VERIFY coupling: the sharded AG skip is only safe when the
+        # accept side will run _dist_selector_accept for this batch — i.e.
+        # selector-sampling (non-greedy) requests with plain sampling. Greedy
+        # and feature-laden requests keep the full gather + classic accept.
+        _dist_active = (
+            getattr(self.selector, "return_path_indices", False)
+            and self._selector_sample is not None
+            and self._selector_walk_cols is not None
+            and self._dist_verify_eligible(batch.sampling_info if hasattr(batch, "sampling_info") else sampling_info)
+        )
+        try:
+            self._draft_block_spec_info.dist_verify_active = _dist_active
+        except Exception:
+            pass
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
