@@ -1,3 +1,4 @@
+import torch
 import triton
 import triton.language as tl
 
@@ -354,3 +355,141 @@ def fragment_final_locate(
         BLOCK_V=4096,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Candidate-space chain verification (dist-verify-softmax stage 2).
+# Operates on [bs, slots, K] candidate tables instead of the full
+# [bs, slots, vocab] prob matrices — p is precomputed per candidate
+# (from the stage-1 gathered logits + global denominator), q comes
+# straight from the selector's q_rows. Exact same accept math.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def chain_verify_candidate_space_kernel(
+    Predicts,
+    AcceptIndex,
+    AcceptTokenNum,
+    Candidates,     # [bs, slots] global vocab ids (the walked path)
+    CandidatePs,    # [bs, slots, slots] target prob of the tested candidate at (row, step)
+    CandidateQs,    # [bs, slots, slots] draft prob of the tested candidate at (row, step)
+    RetriveIndex,
+    UniformSamples,
+    UniformSamplesFinal,
+    stride_cand_b,
+    stride_cand_s,
+    stride_cp_b,
+    stride_cp_s,
+    stride_cp_k,
+    stride_cq_b,
+    stride_cq_s,
+    stride_cq_k,
+    stride_idx_b,
+    stride_idx_s,
+    stride_uni_b,
+    stride_uni_s,
+    NUM_SLOTS: tl.constexpr,
+    NUM_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cur_prob_row = 0
+
+    cand_ptr_base = Candidates + pid * stride_cand_b
+    idx_ptr_base = RetriveIndex + pid * stride_idx_b
+    uni_ptr_base = UniformSamples + pid * stride_uni_b
+
+    root_global_idx = tl.load(idx_ptr_base + 0 * stride_idx_s)
+    tl.store(AcceptIndex + pid * stride_idx_b + 0 * stride_idx_s, root_global_idx)
+    last_accepted_global_idx = root_global_idx
+
+    num_accept = 0
+    step = 1
+    continue_verifying = 1
+
+    while (step < NUM_SLOTS) and (continue_verifying == 1):
+        draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+
+        # Both p and q read the cur_prob_row distribution (the last
+        # accepted position) at the K-column of the walked candidate —
+        # matching the full-vocab kernel's [pid, cur_prob_row, cand] indexing.
+        # The row tables are [bs, slots, K]: row dim = distribution position,
+        # K dim = the 16 candidate columns of that row.
+        p = tl.load(
+            CandidatePs
+            + pid * stride_cp_b
+            + cur_prob_row * stride_cp_s
+            + step * stride_cp_k
+        )
+        q = tl.load(
+            CandidateQs
+            + pid * stride_cq_b
+            + cur_prob_row * stride_cq_s
+            + step * stride_cq_k
+        )
+
+        coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+
+        if coin * q < p:
+            num_accept += 1
+            cur_prob_row = step
+            tl.store(Predicts + last_accepted_global_idx, draft_token)
+
+            curr_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
+            tl.store(
+                AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
+                curr_global_idx,
+            )
+            last_accepted_global_idx = curr_global_idx
+
+            step += 1
+        else:
+            continue_verifying = 0
+
+    tl.store(AcceptTokenNum + pid, num_accept)
+    tl.store(AcceptIndex + pid * stride_idx_b + (num_accept + 1) * stride_idx_s, -1)
+
+
+def chain_verify_candidate_space(
+    candidates,       # [bs, slots]
+    candidate_ps,     # [bs, slots(row), slots(step)] target prob per (row, step)
+    candidate_qs,     # [bs, slots(row), slots(step)] draft prob per (row, step)
+    retrieve_index,   # [bs, slots]
+    uniform_samples,  # [bs, slots-1]
+    uniform_final,    # [bs]
+):
+    bs, slots = candidates.shape
+    K = candidate_ps.shape[-1]
+    predicts = torch.full(
+        (bs * slots,), -1, dtype=torch.int64, device=candidates.device
+    )
+    accept_index = torch.full(
+        (bs, slots), -1, dtype=torch.int64, device=candidates.device
+    )
+    accept_token_num = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    chain_verify_candidate_space_kernel[(bs,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        candidate_ps,
+        candidate_qs,
+        retrieve_index,
+        uniform_samples,
+        uniform_final,
+        candidates.stride(0),
+        candidates.stride(1),
+        candidate_ps.stride(0),
+        candidate_ps.stride(1),
+        candidate_ps.stride(2),
+        candidate_qs.stride(0),
+        candidate_qs.stride(1),
+        candidate_qs.stride(2),
+        retrieve_index.stride(0),
+        retrieve_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        NUM_SLOTS=slots,
+        NUM_K=K,
+    )
+    return predicts, accept_index, accept_token_num
