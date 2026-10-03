@@ -483,3 +483,105 @@ def chain_verify_candidate_space(
         NUM_K=K,
     )
     return predicts, accept_index, accept_token_num
+
+
+# ---------------------------------------------------------------------------
+# Diagonal variant: the chain accept loop always reads (row=step-1, step), so
+# the dense [row, step] table collapses to one vector per step. Exact.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def chain_verify_diagonal_kernel(
+    Predicts,
+    AcceptIndex,
+    AcceptTokenNum,
+    Candidates,     # [bs, slots] walked ids
+    DiagPs,         # [bs, slots] target prob of candidate[step] under row=step-1
+    DiagQs,         # [bs, slots] draft prob (selector q) at the same point
+    RetriveIndex,
+    UniformSamples,
+    stride_cand_b,
+    stride_cand_s,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dq_b,
+    stride_dq_s,
+    stride_idx_b,
+    stride_idx_s,
+    stride_uni_b,
+    stride_uni_s,
+    NUM_SLOTS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cand_ptr_base = Candidates + pid * stride_cand_b
+    idx_ptr_base = RetriveIndex + pid * stride_idx_b
+    uni_ptr_base = UniformSamples + pid * stride_uni_b
+
+    root_global_idx = tl.load(idx_ptr_base + 0 * stride_idx_s)
+    tl.store(AcceptIndex + pid * stride_idx_b + 0 * stride_idx_s, root_global_idx)
+    last_accepted_global_idx = root_global_idx
+
+    num_accept = 0
+    step = 1
+    continue_verifying = 1
+
+    while (step < NUM_SLOTS) and (continue_verifying == 1):
+        draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+        p = tl.load(DiagPs + pid * stride_dp_b + step * stride_dp_s)
+        q = tl.load(DiagQs + pid * stride_dq_b + step * stride_dq_s)
+        coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+
+        if coin * q < p:
+            num_accept += 1
+            tl.store(Predicts + last_accepted_global_idx, draft_token)
+            curr_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
+            tl.store(
+                AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
+                curr_global_idx,
+            )
+            last_accepted_global_idx = curr_global_idx
+            step += 1
+        else:
+            continue_verifying = 0
+
+    tl.store(AcceptTokenNum + pid, num_accept)
+
+
+def chain_verify_diagonal(
+    candidates,      # [bs, slots]
+    diag_ps,         # [bs, slots]
+    diag_qs,         # [bs, slots]
+    retrieve_index,  # [bs, slots]
+    uniform_samples, # [bs, slots-1] or [bs, slots]
+):
+    bs, slots = candidates.shape
+    predicts = torch.full(
+        (bs * slots,), -1, dtype=torch.int64, device=candidates.device
+    )
+    accept_index = torch.full(
+        (bs, slots), -1, dtype=torch.int64, device=candidates.device
+    )
+    accept_token_num = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    chain_verify_diagonal_kernel[(bs,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        diag_ps,
+        diag_qs,
+        retrieve_index,
+        uniform_samples,
+        candidates.stride(0),
+        candidates.stride(1),
+        diag_ps.stride(0),
+        diag_ps.stride(1),
+        diag_qs.stride(0),
+        diag_qs.stride(1),
+        retrieve_index.stride(0),
+        retrieve_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        NUM_SLOTS=slots,
+    )
+    return predicts, accept_index, accept_token_num
