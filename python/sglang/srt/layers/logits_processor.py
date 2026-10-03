@@ -339,6 +339,11 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # DIST-VERIFY: set by the DFlash verify worker when THIS batch will be
+    # accepted through the sharded protocol (selector sampling only). Gates
+    # the full-vocab gather skip; every other verify consumer keeps the gather.
+    dist_verify_active: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -376,6 +381,10 @@ class LogitsMetadata:
         else:
             draft_extend_select_index = None
 
+        _dist_active = bool(
+            getattr(forward_batch.spec_info, "dist_verify_active", False)
+        ) if forward_batch.spec_info is not None else False
+
         return cls(
             forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
@@ -401,6 +410,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            dist_verify_active=_dist_active,
         )
 
     def compute_dp_attention_metadata(self):
@@ -911,11 +921,16 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
+        # Shard passthrough ONLY pairs with the worker's dist accept path
+        # (selector-sampling requests). All other verify consumers — greedy
+        # (compute_dflash_sampling_correct_drafts) and the eligible-fallback
+        # branches — still need the full-vocab gather. The worker flips this
+        # flag per request via _dist_verify_active so the two stay coupled.
         _dist_verify_shard = (
             getattr(self, "_dist_verify_softmax", False)
             and getattr(logits_metadata, "forward_mode", None) is not None
             and logits_metadata.forward_mode.is_target_verify()
-            and not getattr(logits_metadata, "has_custom_logit_processor", False)
+            and bool(getattr(logits_metadata, "dist_verify_active", False))
         )
         if _dist_verify_shard:
             # SGLANG_DIST_VERIFY_SOFTMAX: skip the full-vocab gather; the
