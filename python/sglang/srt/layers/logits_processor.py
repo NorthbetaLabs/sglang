@@ -476,6 +476,7 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        self._dist_verify_softmax = envs.SGLANG_DIST_VERIFY_SOFTMAX.get()
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -910,7 +911,18 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        _dist_verify_shard = (
+            getattr(self, "_dist_verify_softmax", False)
+            and getattr(logits_metadata, "forward_mode", None) is not None
+            and logits_metadata.forward_mode.is_target_verify()
+            and not getattr(logits_metadata, "has_custom_logit_processor", False)
+        )
+        if _dist_verify_shard:
+            # SGLANG_DIST_VERIFY_SOFTMAX: skip the full-vocab gather; the
+            # DFlash verify worker consumes the shard directly (stage-1
+            # kb-scale candidate all_reduce replaces the ~5MB/rank AG).
+            logits = logits  # shard [T, V/tp] flows through unchanged
+        elif self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )

@@ -1090,6 +1090,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
     ) -> None:
         super().__init__()
+        self.return_path_indices = False  # enabled by the dist-verify worker
         if _flashinfer_top_k is None:
             logger.warning(
                 "flashinfer is unavailable; the DFlash2 selector falls back to "
@@ -1147,13 +1148,16 @@ class CandidateSelector(nn.Module):
         rows take the argmax, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
         if scores.is_cuda:
-            return selector_walk_triton(
+            tokens, q_rows, cols = selector_walk_triton(
                 candidate_ids=candidate_ids,
                 scores=scores,
                 uniforms=uniforms,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
             )
+            if self.return_path_indices:
+                return tokens, q_rows, cols
+            return tokens, q_rows
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
         initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
@@ -1193,6 +1197,8 @@ class CandidateSelector(nn.Module):
         q_rows = torch.where(
             greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
         )
+        if self.return_path_indices:
+            return tokens, q_rows, path_indices
         return tokens, q_rows
 
 
