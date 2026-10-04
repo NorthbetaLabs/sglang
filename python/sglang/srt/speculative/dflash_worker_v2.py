@@ -533,6 +533,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
+        # B1: fold the draft input embedding (lookup + attn-TP allreduce) into
+        # the captured draft graph. The runner switches its capture branch on
+        # `hasattr(model, "forward_embed")`, and DFlashDraftModel.forward falls
+        # back to forward_embed when input_embeds is None — so injecting the
+        # target embedding here moves ~1.4ms/step of eager python off the
+        # critical path. Env-gated; classic path keeps the worker-side embed.
+        self._graph_embed = (
+            envs.SGLANG_DFLASH_GRAPH_EMBED.get()
+            and not getattr(self.draft_model, "is_nemotron_35_draft", False)
+        )
+        if self._graph_embed:
+            embed_module_for_graph = unwrap_lora_layer(
+                _resolve_dflash_embedding_module(self.draft_model, target_model)
+            )
+            scale = self._noise_embed_scale
+
+            def _forward_embed(ids: torch.Tensor) -> torch.Tensor:
+                out = embed_module_for_graph(ids)
+                if scale != 1.0:
+                    out = out * scale
+                return out
+
+            self.draft_model.forward_embed = _forward_embed
         if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -2526,17 +2549,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        if self._full_embed_gpu is not None:
+        if self._graph_embed:
+            # B1: embedding runs inside the draft graph via model.forward_embed;
+            # the worker passes raw block_ids through the graph's input_ids
+            # static buffer and skips the per-step eager embed + allreduce.
+            input_embeds = None
+        elif self._full_embed_gpu is not None:
             # Replicated lookup avoids the mismatched attn-TP all_reduce
             # inside VocabParallelEmbedding under dp attention.
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
             )
+            if self._noise_embed_scale != 1.0:
+                noise_embedding = noise_embedding * self._noise_embed_scale
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
         else:
             noise_embedding = embed_module(block_ids)
-        if self._noise_embed_scale != 1.0:
-            noise_embedding = noise_embedding * self._noise_embed_scale
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            if self._noise_embed_scale != 1.0:
+                noise_embedding = noise_embedding * self._noise_embed_scale
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
