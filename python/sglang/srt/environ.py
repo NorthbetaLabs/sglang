@@ -1107,6 +1107,11 @@ class Envs:
     # DFlash verify step and run the accept/final protocol on vocab shards
     # (kb-scale communication instead of ~5MB/rank). Off = classic behavior.
     SGLANG_DIST_VERIFY_SOFTMAX = EnvBool(False)
+    # B1: run the DFlash draft input embedding (VocabParallelEmbedding + its
+    # attn-TP allreduce) inside the captured draft graph via the model's
+    # forward_embed branch, instead of a per-step eager embed in the worker.
+    # Off = classic eager embeds outside the graph.
+    SGLANG_DFLASH_GRAPH_EMBED = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
