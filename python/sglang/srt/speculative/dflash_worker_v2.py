@@ -238,6 +238,8 @@ class _StepInstrument:
         self._last_tag = None
         self._segs: dict = {}  # tag -> [total_us, n]
         self._step_us: list = []
+        self._gpu_us: list = []
+        self._gpu_ev = None
         self._step_start_t = None
         import random
 
@@ -266,8 +268,29 @@ class _StepInstrument:
         if self._step_start_t is not None:
             self._step_us.append((time.perf_counter_ns() - self._step_start_t) / 1e6)
             self._step_start_t = None
+            if isinstance(self._gpu_ev, list) and len(self._gpu_ev) == 2:
+                self._gpu_ev[1].synchronize()
+                self._gpu_us.append(self._gpu_ev[0].elapsed_time(self._gpu_ev[1]))
+            self._gpu_ev = None
             if len(self._step_us) >= min(64, self._max):
                 self._flush()
+
+    def gpu_mark(self, tag: str) -> None:
+        """Record a CUDA event on the current stream (B3: real GPU wall).
+
+        Only active on sampled steps (aligned with tick sampling): the first
+        gpu_mark of a non-sampled step is a no-op and marks the bracket dead.
+        """
+        if self._step_start_t is None:
+            # not a sampled step — skip (and poison any open bracket)
+            self._gpu_ev = None
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        if tag == "v_start":
+            self._gpu_ev = [ev]
+        elif tag == "v_end" and isinstance(self._gpu_ev, list) and self._gpu_ev:
+            self._gpu_ev.append(ev)
 
     def _flush(self) -> None:
         import statistics as _st
@@ -275,10 +298,12 @@ class _StepInstrument:
         lines = [f"{k}: {v[0]/v[1]:.0f}us(n={v[1]})" for k, v in self._segs.items()]
         if self._step_us:
             p50 = _st.median(self._step_us)
+            gpu_p50 = _st.median(self._gpu_us) if self._gpu_us else -1.0
             logger.info(
-                "DFLASH_STEP_TIMER steps=%d p50=%.2fms | %s",
+                "DFLASH_STEP_TIMER steps=%d p50=%.2fms gpu_verify_p50=%.2fms | %s",
                 len(self._step_us),
                 p50,
+                gpu_p50,
                 " ".join(lines),
             )
 
@@ -2921,6 +2946,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_sum = seq_lens_sum_backup
         if _instr is not None:
             _instr.tick("s5_verify_launch")
+            # B3: GPU-side event bracket around the verify forward. Events are
+            # recorded on the current stream, so the elapsed time measures the
+            # real GPU wall of the verify segment (draft tail included in the
+            # s2->s5 gap, excluded here) without any CUPTI involvement.
+            _instr.gpu_mark("v_start")
 
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
@@ -2948,6 +2978,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         if _instr is not None:
+            _instr.gpu_mark("v_end")
             _instr.tick("s6_verify_done")
             _instr.step_end()
 
