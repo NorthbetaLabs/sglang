@@ -1256,6 +1256,10 @@ class Envs:
     # forward_embed branch, instead of a per-step eager embed in the worker.
     # Off = classic eager embeds outside the graph.
     SGLANG_DFLASH_GRAPH_EMBED = EnvBool(False)
+    # B2: no-profiler wall-clock segment instrumentation of the DFlash decode
+    # step's host path. Format "<num_steps>[:<rate_percent>]", e.g. "512" or
+    # "512:25". Off = no instrumentation.
+    SGLANG_DFLASH_STEP_TIMER = EnvStr("")
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)

@@ -1,6 +1,8 @@
 import logging
 import math
 import os
+import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -214,6 +216,83 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
             )
         return embed_module
     return target_model.get_input_embeddings()
+
+
+class _StepInstrument:
+    """No-profiler wall-clock segment timer for the DFlash decode step.
+
+    Measures the scheduler thread's real serialization cost without CUPTI
+    inflation (the four trace-caliber lessons). Env: SGLANG_DFLASH_STEP_TIMER
+    = "<num_steps>[:<rate_percent>]" — collect up to num_steps samples, each
+    step sampled with probability rate_percent (default 100). Only segments
+    between consecutive tick() calls are recorded; a segment is only
+    meaningful when the code path between them is pure host-side work.
+    Results are logged as one summary line per collection window.
+    """
+
+    def __init__(self, num_steps: int, rate_percent: int):
+        self._max = num_steps
+        self._rate = max(1, min(100, rate_percent))
+        self._count = 0
+        self._last_t = None
+        self._last_tag = None
+        self._segs: dict = {}  # tag -> [total_us, n]
+        self._step_us: list = []
+        self._step_start_t = None
+        import random
+
+        self._rng = random.Random(1234)
+
+    def tick(self, tag: str) -> None:
+        t = time.perf_counter_ns()
+        if tag == "s0_step_start":
+            # decide whether this step is sampled at all; always drop the
+            # previous step's trailing tick so no cross-step segment forms
+            self._last_t = None
+            self._last_tag = None
+            if self._count >= self._max or self._rng.randrange(100) >= self._rate:
+                self._step_start_t = None
+                return
+            self._step_start_t = t
+            self._count += 1
+        if self._last_t is not None and self._last_tag is not None:
+            seg = self._segs.setdefault(f"{self._last_tag}->{tag}", [0, 0])
+            seg[0] += (t - self._last_t) / 1000.0
+            seg[1] += 1
+        self._last_t = t
+        self._last_tag = tag
+
+    def step_end(self) -> None:
+        if self._step_start_t is not None:
+            self._step_us.append((time.perf_counter_ns() - self._step_start_t) / 1e6)
+            self._step_start_t = None
+            if len(self._step_us) >= min(64, self._max):
+                self._flush()
+
+    def _flush(self) -> None:
+        import statistics as _st
+
+        lines = [f"{k}: {v[0]/v[1]:.0f}us(n={v[1]})" for k, v in self._segs.items()]
+        if self._step_us:
+            p50 = _st.median(self._step_us)
+            logger.info(
+                "DFLASH_STEP_TIMER steps=%d p50=%.2fms | %s",
+                len(self._step_us),
+                p50,
+                " ".join(lines),
+            )
+
+
+def _parse_step_timer(env_val: str):
+    try:
+        parts = env_val.split(":")
+        n = int(parts[0])
+        rate = int(parts[1]) if len(parts) > 1 else 100
+        if n <= 0:
+            return None
+        return _StepInstrument(n, rate)
+    except Exception:
+        return None
 
 
 def _is_all_greedy(sampling_info) -> bool:
@@ -579,6 +658,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._noise_embed_scale,
             )
 
+        # B2: no-profiler step instrumentation (see _StepInstrument).
+        self._step_instr = _parse_step_timer(
+            envs.SGLANG_DFLASH_STEP_TIMER.get() or ""
+        )
+        if self._step_instr is not None and self.ps.tp_rank == 0:
+            logger.info("DFLASH step timer enabled (SGLANG_DFLASH_STEP_TIMER=%s)",
+                        envs.SGLANG_DFLASH_STEP_TIMER.get())
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.block_size, device=self.device
         )
@@ -2467,6 +2553,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
+        # B2 INSTRUMENTATION: no-profiler wall-clock segment timing of the
+        # decode step's host path. Env-gated (SGLANG_DFLASH_STEP_TIMER=steps[:rate]);
+        # log lines carry the DFLASH_STEP_TIMER prefix for grep. Segments are
+        # wall-clock spans of the scheduler thread, NOT GPU costs — used to
+        # measure real python serialization without CUPTI inflation.
+        _instr = self._step_instr
+        if _instr is not None:
+            _instr.tick("s0_step_start")
         embed_module = unwrap_lora_layer(
             _resolve_dflash_embedding_module(self.draft_model, target_model)
         )
@@ -2493,6 +2587,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        _instr = self._step_instr
+        if _instr is not None:
+            _instr.tick("s1_pre_draft_meta")
         if self._use_triton_prepare_block:
             try:
                 _prepare_dflash_draft_block_unchecked(
@@ -2640,6 +2737,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs=bs, sampling_info=batch.sampling_info
                 )
 
+        if _instr is not None:
+            _instr.tick("s2_draft_replay")
         with (
             torch.inference_mode(),
             self.draft_tp_context(
@@ -2649,6 +2748,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+        if _instr is not None:
+            _instr.tick("s3_post_draft")
 
         if (
             self._is_domino
@@ -2818,6 +2919,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        if _instr is not None:
+            _instr.tick("s5_verify_launch")
 
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
@@ -2844,6 +2947,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        if _instr is not None:
+            _instr.tick("s6_verify_done")
+            _instr.step_end()
 
         grammar_mask = None
         if batch.has_grammar:
