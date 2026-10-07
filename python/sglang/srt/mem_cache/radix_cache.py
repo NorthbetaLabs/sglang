@@ -196,10 +196,17 @@ class RadixKey:
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
         if other.is_bigram:
-            # Logical-unit offset maps to raw tokens one-to-one plus the
-            # boundary token; slice views must own that mapping, so fall
-            # back to the sliced path (bigram keys are draft-model sized).
-            return self.match(other[offset:], page_size=page_size)
+            # EAGLE-mode request keys are bigram-shaped and DO reach tree
+            # walks (the docstring's old assumption no longer holds). The
+            # historical fallback recursed into match(other[offset:]), but
+            # the sliced view is itself bigram, so every recursion level
+            # re-entered this branch -> RecursionError on real 8K prompts.
+            # Match on raw tokens directly instead: offset maps one-to-one
+            # onto raw tokens (plus the boundary token), so the raw-token
+            # comparison below already carries the right semantics with
+            # `offset` applied, and the bigram logical-length rounding
+            # mirrors the self.is_bigram tail below.
+            pass
         n = min(len(t0), len(t1) - offset)
 
         # Exponential search for the first diverging token: gallop in doubling
