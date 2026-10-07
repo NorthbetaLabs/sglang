@@ -193,6 +193,10 @@ class RadixKey:
             raise IndexError(f"RadixKey offset out of range: {offset}")
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
+        # Bigram request keys (EAGLE/NEXTN draft trees) reach tree walks with
+        # a logical-unit offset that maps one-to-one onto raw tokens (plus the
+        # boundary token), so the raw-token comparison below already carries
+        # the right semantics; no sliced fallback (it recursed infinitely).
         n = min(self._raw_len(), other._raw_len() - offset)
 
         # Exponential search for the first diverging token: gallop in doubling
