@@ -9,6 +9,26 @@ import torch
 AuxHiddenStates = Union[torch.Tensor, List[torch.Tensor]]
 
 
+class AuxHiddenStateList(list):
+    """Retain aux snapshots independently of storage reused by later layers.
+
+    Views and reusable communication buffers are borrowed even when they
+    are different tensor objects from the source.
+    """
+
+    # ``capture`` clones borrowed values, so a later layer may reuse storage.
+    copies_on_append = False
+
+    def capture(self, hidden: torch.Tensor, *, owned: bool = False) -> None:
+        """Copy borrowed storage, or adopt a value whose ownership is transferred."""
+        self.append(hidden if owned else hidden.clone())
+
+    def append(self, hidden: torch.Tensor) -> None:
+        if getattr(self, "copies_on_append", False):
+            hidden = hidden.clone()
+        super().append(hidden)
+
+
 class AuxHiddenStatePacker:
     """Drop-in for the ``[]`` a model collects Eagle3/DFlash captures into.
 
@@ -49,7 +69,7 @@ class AuxHiddenStatePacker:
 
 
 # What a model hands down the capture path: a plain list, or a packer writing in place.
-AuxHiddenStateAccumulator = Union[List[torch.Tensor], AuxHiddenStatePacker]
+AuxHiddenStateAccumulator = Union[AuxHiddenStateList, List[torch.Tensor], AuxHiddenStatePacker]
 
 
 def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:

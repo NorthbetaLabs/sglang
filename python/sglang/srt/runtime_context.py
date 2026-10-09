@@ -54,6 +54,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -581,6 +582,13 @@ class Resources(_FlagGroupBase):
     trace_level: Any = None
 
 
+class LoRABatchLayout(Enum):
+    """Token layout used by LoRA kernels in the current model section."""
+
+    DP_LOCAL = auto()
+    TP_GLOBAL = auto()
+
+
 class ForwardFlags:
     """Per-forward runtime flags with one API and two backings.
 
@@ -618,6 +626,9 @@ class ForwardFlags:
         "flashinfer_trtllm_bypass": False,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # Attention runs on a DP-local token batch. The MLP runs after the DP
+        # gather and therefore uses the TP-global token batch.
+        "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,

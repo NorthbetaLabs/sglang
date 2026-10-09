@@ -78,6 +78,11 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     return backend
 
 
+def uses_cutedsl_ar_fusion() -> bool:
+    """Selected CuTe DSL owns both patterns, so the legacy workspace stands down."""
+    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
+
+
 def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
     """The fusion backend for this process, or None when fusion is off.
 

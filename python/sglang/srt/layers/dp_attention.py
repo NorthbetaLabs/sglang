@@ -60,6 +60,15 @@ def world_dp_gather_enabled() -> bool:
     return dp.use_world_group_for_gather and not dp.joiner_skip_all_gather
 
 
+def can_use_dp_reduce_scatter() -> bool:
+    """Whether the fixed TP group tiles the current attention DP x TP layout."""
+    if not world_dp_gather_enabled():
+        return True
+
+    parallel = get_parallel()
+    return parallel.tp_size == parallel.attn_dp_size * parallel.attn_tp_size
+
+
 def enable_joiner_all_gather():
     get_flags().dp.joiner_skip_all_gather = False
 

@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
     get_cp_strategy,
+    is_cp_enabled,
 )
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
@@ -35,7 +36,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -134,6 +135,16 @@ def enable_cp_v2() -> bool:
     from sglang.srt.environ import envs
 
     return bool(envs.SGLANG_ENABLE_CP_V2.get())
+
+
+def is_mla_cp_enabled() -> bool:
+    """Return whether prefill CP is configured for an MLA attention backend."""
+    return is_cp_enabled() and uses_mla_backend()
+
+
+def is_mla_cp_active(forward_batch) -> bool:
+    """Return whether this MLA forward batch is using prefill CP."""
+    return is_mla_cp_enabled() and is_cp_v2_active(forward_batch)
 
 
 def is_cp_v2_active(forward_batch) -> bool:
@@ -326,6 +337,8 @@ __all__ = [
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",
+    "is_mla_cp_active",
+    "is_mla_cp_enabled",
     "cp_gather_after_forward",
     "cp_materialize_global_token_order",
     "cp_round_robin_input_ids_v2",
