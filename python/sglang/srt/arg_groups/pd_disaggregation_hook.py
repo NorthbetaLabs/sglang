@@ -94,11 +94,18 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+            if cfg.speculative_algorithm is not None:
+                # PBD fork: the mutual exclusion was a conservative gate, not a
+                # structural limit (the radix tree is spec-aware: bigram keys,
+                # spec-tail handling; the radix-aware release path routes the
+                # hazards). DFlash+decode-radix has served production GLM-5.3
+                # since 2026-09-26; keep DSPARK's upstream allowance too.
+                logger.warning(
+                    "EXPERIMENTAL: Decode radix cache together with speculative "
+                    f"decoding (--speculative-algorithm {cfg.speculative_algorithm}). "
+                    "The radix tree uses bigram (EAGLE) keys; prealloc prefix "
+                    "matching, prebuilt caching and finish/retract release all "
+                    "route through the eagle-aware radix paths."
                 )
 
             if resolved_view(server_args).enable_dp_attention:
