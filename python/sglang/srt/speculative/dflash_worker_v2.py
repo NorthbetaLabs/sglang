@@ -687,7 +687,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._step_instr = _parse_step_timer(
             envs.SGLANG_DFLASH_STEP_TIMER.get() or ""
         )
-        if self._step_instr is not None and self.ps.tp_rank == 0:
+        if self._step_instr is not None and self.model_runner.tp_rank == 0:
             logger.info("DFLASH step timer enabled (SGLANG_DFLASH_STEP_TIMER=%s)",
                         envs.SGLANG_DFLASH_STEP_TIMER.get())
         self._block_pos_offsets = build_block_pos_offsets(
