@@ -1032,7 +1032,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
-            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+            # MoE a2a (megamoe budget alignment) may append token padding that
+            # is not a complete verify sequence; it must stay out of the conv
+            # and state updates. Verify here is uniform-drafts-per-seq, so the
+            # logical token count derives from query_start_loc.
+            physical_num_tokens = mixed_qkv.shape[0]
+            logical_num_tokens = (
+                self.forward_metadata.query_start_loc.shape[0] - 1
+            ) * forward_batch.spec_info.draft_token_num
+            if logical_num_tokens < physical_num_tokens:
+                mixed_qkv = mixed_qkv[:logical_num_tokens]
+                a = a[:, :logical_num_tokens]
+                b = b[:, :logical_num_tokens]
+            core_attn_out = self._forward_target_verify(
+                layer, forward_batch, mixed_qkv, a, b
+            )
+            if logical_num_tokens < physical_num_tokens:
+                pad = core_attn_out.new_zeros(
+                    (1, physical_num_tokens - logical_num_tokens)
+                    + tuple(core_attn_out.shape[2:])
+                )
+                core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+            return core_attn_out
 
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
